@@ -354,14 +354,14 @@ def _is_date_header_line(line: str) -> bool:
     stripped = re.sub(r"\b\d{1,2}\.\d{2}\.\d{4}\b", "", s)
     stripped = TEXT_DATE_RE.sub("", stripped)
     stripped = WEEKDAY_RE.sub("", stripped.strip())
-    stripped = re.sub(r"[\s,.;:|()\-–]+", "", stripped)
+    stripped = re.sub(r"[\s,.;:|()-–]+", "", stripped)
     return bool(_extract_full_dates_from_text(s) and len(stripped) == 0)
 
 
 def _strip_leading_date_or_weekday(text: str) -> str:
-    s = re.sub(r"^\s*\d{1,2}\.\d{2}\.\d{4}\s*[,.;:|()\-–]*\s*", "", text)
+    s = re.sub(r"^\s*\d{1,2}\.\d{2}\.\d{4}\s*[,.;:|()-–]*\s*", "", text)
     s = re.sub(
-        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)\s*[,.;:|()\-–]*\s*",
+        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)\s*[,.;:|()-–]*\s*",
         "",
         s,
         flags=re.IGNORECASE,
@@ -387,7 +387,7 @@ def _split_text_by_dates(text: str, active_date: str) -> list[tuple[str, str]]:
         seg_date = parsed_dates[0] if parsed_dates else active_date
         start_pos = m.end()
         end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        body = text[start_pos:end_pos].strip(" ,.;:|()\-–")
+        body = text[start_pos:end_pos].strip(" ,.;:|()-–")
         if body:
             segments.append((seg_date, body))
 
@@ -542,6 +542,62 @@ def _extract_tables_from_page(page) -> list:
     )
 
 
+def _collect_page_date_anchors(page, fallback_year: str | None) -> list[tuple[float, float, float, str]]:
+    """Collects (top, x0, x1, date_str) anchors on a page using word/line coordinates."""
+    anchors: list[tuple[float, float, float, str]] = []
+    words = page.extract_words() or []
+    for w in words:
+        txt = (w.get("text") or "").strip()
+        if not txt:
+            continue
+        dates = _extract_dates_from_text(txt, fallback_year=fallback_year, allow_short=False)
+        for d in dates:
+            anchors.append(
+                (
+                    float(w.get("top", 0.0)),
+                    float(w.get("x0", 0.0)),
+                    float(w.get("x1", 0.0)),
+                    d,
+                )
+            )
+    anchors.sort(key=lambda a: (a[0], a[1]))
+    deduped: list[tuple[float, float, float, str]] = []
+    for top_v, x0_v, x1_v, d_str in anchors:
+        if any(
+            abs(top_v - p_top) <= 3.0
+            and abs(x0_v - p_x0) <= 12.0
+            and d_str == p_d
+            for p_top, p_x0, _, p_d in deduped
+        ):
+            continue
+        deduped.append((top_v, x0_v, x1_v, d_str))
+    return deduped
+
+
+def _resolve_date_by_position(
+    anchors: list[tuple[float, float, float, str]],
+    item_top: float,
+    item_x0: float,
+    item_x1: float,
+    fallback_date: str,
+) -> str:
+    """Finds the most recent date anchor above `item_top` (preferring same/left column)."""
+    if not anchors:
+        return fallback_date
+
+    above = [a for a in anchors if a[0] <= item_top + 2.0]
+    if not above:
+        return fallback_date
+
+    # Prefer anchors that overlap horizontally or lie to the left of the item
+    col_candidates = [
+        a for a in above if (a[1] <= item_x1 + 20.0 and a[2] >= item_x0 - 20.0) or a[1] <= item_x0 + 10.0
+    ]
+    pool = col_candidates if col_candidates else above
+    pool.sort(key=lambda a: (a[0], -abs(a[1] - item_x0)))
+    return pool[-1][3]
+
+
 def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
     pages_lines: list[tuple[list[str], list[str]]] = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -693,6 +749,7 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                 if years_in_page:
                     fallback_year = years_in_page[-1]
 
+            date_anchors = _collect_page_date_anchors(page, fallback_year)
             page_groups = _extract_groups_from_text(page_txt)
             group_columns: dict[int, str] = {}
 
@@ -702,9 +759,21 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                 if not table:
                     continue
 
-                for row in table:
+                t_bbox = getattr(t_obj, "bbox", None)
+                t_top = float(t_bbox[1]) if t_bbox and len(t_bbox) >= 4 else 0.0
+                t_bottom = float(t_bbox[3]) if t_bbox and len(t_bbox) >= 4 else float(getattr(page, "height", 1000.0))
+                t_x0 = float(t_bbox[0]) if t_bbox and len(t_bbox) >= 4 else 0.0
+                t_x1 = float(t_bbox[2]) if t_bbox and len(t_bbox) >= 4 else float(getattr(page, "width", 1000.0))
+                num_rows = max(len(table), 1)
+                row_height = (t_bottom - t_top) / num_rows
+
+                for row_idx, row in enumerate(table):
                     if not row:
                         continue
+
+                    row_top = t_top + row_idx * row_height
+                    num_cols = max(len(row), 1)
+                    col_width = (t_x1 - t_x0) / num_cols
 
                     cleaned_cells = [clean_cell(c) for c in row]
                     non_empty_cells = [
@@ -745,7 +814,7 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                         if _is_date_header_line(joined_row) or len(non_empty_cells) == 1:
                             continue
 
-                    active_date = current_date or _format_default_date(fallback_year)
+                    base_fallback_date = current_date or _format_default_date(fallback_year)
                     lesson_counter += 1
                     lesson_num = detect_lesson_number(row, lesson_counter)
 
@@ -756,16 +825,27 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                             if not cell_lines:
                                 continue
 
-                            local_date = active_date
-                            for c_line in cell_lines:
+                            cell_x0 = t_x0 + col_idx * col_width
+                            cell_x1 = cell_x0 + col_width
+                            line_step = row_height / max(len(cell_lines), 1)
+
+                            for line_i, c_line in enumerate(cell_lines):
+                                line_top = row_top + line_i * line_step
+                                pos_date = _resolve_date_by_position(
+                                    date_anchors,
+                                    line_top,
+                                    cell_x0,
+                                    cell_x1,
+                                    base_fallback_date,
+                                )
                                 line_dates = _extract_full_dates_from_text(c_line)
                                 if line_dates:
-                                    local_date = line_dates[-1]
-                                    current_date = local_date
+                                    pos_date = line_dates[-1]
+                                    current_date = pos_date
                                     if _is_date_header_line(c_line):
                                         continue
 
-                                for seg_date, seg_txt in _split_text_by_dates(c_line, local_date):
+                                for seg_date, seg_txt in _split_text_by_dates(c_line, pos_date):
                                     item = parse_cell_to_lesson(
                                         seg_date, group_name, lesson_num, seg_txt, warnings
                                     )
@@ -773,16 +853,25 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                                         results.append(item)
                     else:
                         target_groups = page_groups or ["Загальний потік"]
-                        for _, cell_txt in non_empty_cells:
+                        for col_idx, cell_txt in non_empty_cells:
                             if _is_date_header_line(cell_txt):
                                 continue
                             if LESSON_NUM_RE.match(cell_txt) or WEEKDAY_RE.match(
                                 cell_txt
                             ):
                                 continue
+                            cell_x0 = t_x0 + col_idx * col_width
+                            cell_x1 = cell_x0 + col_width
+                            pos_date = _resolve_date_by_position(
+                                date_anchors,
+                                row_top,
+                                cell_x0,
+                                cell_x1,
+                                base_fallback_date,
+                            )
                             cell_groups = _extract_groups_from_text(cell_txt)
                             groups_for_cell = cell_groups or target_groups
-                            for seg_date, seg_txt in _split_text_by_dates(cell_txt, active_date):
+                            for seg_date, seg_txt in _split_text_by_dates(cell_txt, pos_date):
                                 for g_name in groups_for_cell:
                                     item = parse_cell_to_lesson(
                                         seg_date, g_name, lesson_num, seg_txt, warnings
