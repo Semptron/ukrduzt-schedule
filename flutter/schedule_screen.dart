@@ -659,7 +659,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     if (now.isAfter(start) && now.isBefore(end)) {
       final minsLeft = end.difference(now).inMinutes + 1;
-      return 'Йде зараз • до кінця $minsLeft хв';
+      return 'Йде зараз \u2022 до кінця $minsLeft хв';
     }
     if (now.isBefore(start)) {
       final minsToStart = start.difference(now).inMinutes + 1;
@@ -748,7 +748,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '\${featuredLesson.lessonNumber} пара (\${featuredLesson.timeStart}–\${featuredLesson.timeEnd}) • \${featuredLesson.subject}',
+                      '${featuredLesson.lessonNumber} пара (${featuredLesson.timeStart}\u2013${featuredLesson.timeEnd}) \u2022 ${featuredLesson.subject}',
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 8),
@@ -826,7 +826,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                           final zoomCfg = _getZoomConfig(item);
                           final note = _lessonNotes[buildNoteKey(item)];
                           final metaParts = <String>[
-                            '\${item.lessonNumber} пара (\${item.timeStart}–\${item.timeEnd})',
+                            '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
                             'Онлайн',
                             if (item.lessonType != null) item.lessonType!,
                             if (item.teacher != null) item.teacher!,
@@ -847,7 +847,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                                     ),
                                   ),
                                   const SizedBox(height: 4),
-                                  Text('\${item.date} • \${metaParts.join(' • ')}'),
+                                  Text('${item.date} \u2022 ${metaParts.join(' \u2022 ')}'),
                                   const SizedBox(height: 4),
                                   Text(
                                     _liveStatusText(item),
@@ -863,7 +863,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                                         if ((zoomCfg.meetingCode ?? '').isNotEmpty)
                                           ActionChip(
                                             avatar: const Icon(Icons.copy, size: 16),
-                                            label: Text('Код: \${zoomCfg.meetingCode}'),
+                                            label: Text('Код: ${zoomCfg.meetingCode}'),
                                             onPressed: () => _copyText(
                                               'Код конференції',
                                               zoomCfg.meetingCode!,
@@ -872,7 +872,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                                         if ((zoomCfg.password ?? '').isNotEmpty)
                                           ActionChip(
                                             avatar: const Icon(Icons.copy, size: 16),
-                                            label: Text('Пароль: \${zoomCfg.password}'),
+                                            label: Text('Пароль: ${zoomCfg.password}'),
                                             onPressed: () => _copyText(
                                               'Пароль конференції',
                                               zoomCfg.password!,
