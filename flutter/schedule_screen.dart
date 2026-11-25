@@ -35,7 +35,6 @@ bool _isValidGroupName(String raw) {
     if (lower.contains(frag)) return false;
   }
 
-  // Назви груп зазвичай містять цифри та/або дефіс (наприклад, 101-ЛЛГ-326)
   return RegExp(r'[0-9]').hasMatch(s) || s.contains('-');
 }
 
@@ -220,6 +219,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   bool _offlineBanner = false;
   String? _error;
   Timer? _ticker;
+  int _scheduleRequestId = 0;
 
   @override
   void initState() {
@@ -273,7 +273,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     final cachedLessons = _readCachedLessons(prefs, _selectedGroup);
-    if (cachedLessons.isNotEmpty) {
+    if (cachedLessons.isNotEmpty && mounted) {
       setState(() {
         _lessons = cachedLessons;
         _selectedDate = _pickInitialDate(cachedLessons);
@@ -281,10 +281,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       });
     }
 
-    await Future.wait([
-      _fetchGroups(prefs),
-      _fetchSchedule(prefs, showSpinnerIfEmpty: cachedLessons.isEmpty),
-    ]);
+    await _fetchGroups(prefs);
+    await _fetchSchedule(prefs, showSpinnerIfEmpty: cachedLessons.isEmpty);
   }
 
   String? _pickInitialDate(List<LessonModel> items) {
@@ -392,7 +390,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         await prefs.setString(kGroupsCachePrefsKey, jsonEncode(list));
         if (groupChanged) {
           await prefs.setString(kSelectedGroupPrefsKey, nextGroup);
-          await _fetchSchedule(prefs, showSpinnerIfEmpty: true);
         }
       }
     } catch (_) {}
@@ -402,10 +399,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     SharedPreferences? prefs, {
     bool showSpinnerIfEmpty = true,
   }) async {
+    final reqId = ++_scheduleRequestId;
+    final targetGroup = _selectedGroup;
     final sp = prefs ?? await SharedPreferences.getInstance();
-    final cached = _readCachedLessons(sp, _selectedGroup);
+    final cached = _readCachedLessons(sp, targetGroup);
 
-    if (showSpinnerIfEmpty && cached.isEmpty) {
+    if (showSpinnerIfEmpty && cached.isEmpty && mounted) {
       setState(() {
         _loading = true;
         _error = null;
@@ -414,19 +413,20 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     try {
       final uri = Uri.parse(
-        '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(_selectedGroup)}',
+        '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}',
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 65));
 
+      if (!mounted || reqId != _scheduleRequestId) return;
+
       if (resp.statusCode == 404) {
-        if (!mounted) return;
         setState(() {
           _lessons = [];
           _selectedDate = null;
           _loading = false;
           _offlineBanner = false;
           _error =
-              'Для групи "$_selectedGroup" розклад наразі відсутній на сервері (HTTP 404). Оберіть іншу групу у верхньому списку.';
+              'Для групи "$targetGroup" розклад наразі відсутній на сервері (HTTP 404). Оберіть іншу групу у верхньому списку.';
         });
         return;
       }
@@ -441,11 +441,11 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
           .toList();
 
       await sp.setString(
-        _scheduleCacheKey(_selectedGroup),
+        _scheduleCacheKey(targetGroup),
         jsonEncode(items.map((e) => e.toJson()).toList()),
       );
 
-      if (!mounted) return;
+      if (!mounted || reqId != _scheduleRequestId) return;
       setState(() {
         _lessons = items;
         _selectedDate =
@@ -455,11 +455,11 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         _loading = false;
         _offlineBanner = false;
         _error = items.isEmpty
-            ? 'Сервер повернув порожній розклад для групи "$_selectedGroup".'
+            ? 'Сервер повернув порожній розклад для групи "$targetGroup".'
             : null;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || reqId != _scheduleRequestId) return;
       if (cached.isNotEmpty) {
         setState(() {
           _lessons = cached;
@@ -472,7 +472,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         setState(() {
           _loading = false;
           _offlineBanner = true;
-          _error = 'Немає зв’язку і кешу для групи $_selectedGroup: $e';
+          _error = 'Немає зв’язку і кешу для групи $targetGroup: $e';
         });
       }
     }
@@ -484,6 +484,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     await prefs.setString(kSelectedGroupPrefsKey, newGroup);
 
     final cached = _readCachedLessons(prefs, newGroup);
+    if (!mounted) return;
     setState(() {
       _selectedGroup = newGroup;
       _lessons = cached;
@@ -660,6 +661,10 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       ),
     );
 
+    urlController.dispose();
+    codeController.dispose();
+    passController.dispose();
+
     if (result != null) {
       await _saveZoomConfig(lesson, result);
     }
@@ -693,6 +698,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         ],
       ),
     );
+
+    controller.dispose();
 
     if (result != null) await _saveNote(lesson, result);
   }
