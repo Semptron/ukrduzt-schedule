@@ -3,8 +3,8 @@ import logging
 import re
 from pathlib import Path
 from urllib.parse import urljoin
-import httpx
 from bs4 import BeautifulSoup
+import httpx
 from database import get_file_hash, replace_source_lessons
 from parser import parse_schedule_pdf_detailed
 
@@ -12,6 +12,9 @@ logger = logging.getLogger("ukrduzt-scraper")
 PORTAL_URL = "https://kart.edu.ua/osvita/portal-rz"
 DOWNLOAD_DIR = Path("downloads")
 FILE_EXT_RE = re.compile(r"\.(pdf|xlsx|xls)$", re.IGNORECASE)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; UkrDUZT-Schedule-Sync/1.0)"
+}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -19,8 +22,9 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; UkrDUZT-Schedule-Sync/1.0)"}
-    with httpx.Client(timeout=20.0, follow_redirects=True, headers=headers) as client:
+    with httpx.Client(
+        timeout=20.0, follow_redirects=True, headers=DEFAULT_HEADERS
+    ) as client:
         resp = client.get(portal_url)
         resp.raise_for_status()
 
@@ -29,6 +33,8 @@ def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
 
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
+        if not href:
+            continue
         full_url = urljoin(portal_url, href)
         clean_path = full_url.split("?", 1)[0]
         if FILE_EXT_RE.search(clean_path):
@@ -44,36 +50,50 @@ def run_sync() -> dict:
     failed_files = 0
     total_lessons_saved = 0
 
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; UkrDUZT-Schedule-Sync/1.0)"}
-    with httpx.Client(timeout=30.0, follow_redirects=True, headers=headers) as client:
+    with httpx.Client(
+        timeout=30.0, follow_redirects=True, headers=DEFAULT_HEADERS
+    ) as client:
         for url in urls:
+            local_path: Path | None = None
             try:
                 resp = client.get(url)
                 resp.raise_for_status()
                 content = resp.content
-                file_hash = sha256_bytes(content)
+                if not content:
+                    raise ValueError("Empty file downloaded")
 
+                file_hash = sha256_bytes(content)
                 if get_file_hash(url) == file_hash:
                     continue
 
-                filename = Path(url.split("?", 1)[0]).name or "schedule.pdf"
-                local_path = DOWNLOAD_DIR / filename
+                raw_name = Path(url.split("?", 1)[0]).name or "schedule.pdf"
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name)
+                local_path = DOWNLOAD_DIR / safe_name
                 local_path.write_bytes(content)
 
-                if local_path.suffix.lower() == ".pdf":
+                ext = local_path.suffix.lower()
+                if ext == ".pdf":
                     parsed_bundle = parse_schedule_pdf_detailed(str(local_path))
-                    lessons = parsed_bundle["lessons"]
-                    warnings = parsed_bundle["warnings"]
+                    lessons = parsed_bundle.get("lessons") or []
+                    warnings = parsed_bundle.get("warnings") or []
 
                     if not lessons:
-                        raise ValueError(f"Zero lessons parsed from {filename}")
+                        raise ValueError(f"Zero lessons parsed from {raw_name}")
 
                     replace_source_lessons(url, file_hash, lessons, len(warnings))
                     updated_files += 1
                     total_lessons_saved += len(lessons)
+                else:
+                    logger.info("Skipping unsupported file format %s", raw_name)
             except Exception as exc:
                 failed_files += 1
                 logger.warning("Failed syncing %s: %s", url, exc)
+            finally:
+                if local_path and local_path.exists():
+                    try:
+                        local_path.unlink()
+                    except OSError:
+                        pass
 
     return {
         "found_files": len(urls),
