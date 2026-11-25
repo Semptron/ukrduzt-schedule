@@ -40,31 +40,43 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
     super.dispose();
   }
 
+  List<LessonModel> _collectCachedLessons(SharedPreferences prefs) {
+    final lessons = <LessonModel>[];
+    for (final key in prefs.getKeys()) {
+      if (!key.startsWith('ukrduzt_schedule_cache_')) continue;
+      final raw = prefs.getString(key);
+      if (raw == null || raw.isEmpty) continue;
+      try {
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        for (final item in decoded) {
+          lessons.add(LessonModel.fromJson(item as Map<String, dynamic>));
+        }
+      } catch (_) {}
+    }
+    return lessons;
+  }
+
   Future<void> _loadLocalZoomAndTeachers() async {
     final prefs = await SharedPreferences.getInstance();
 
     final rawMeetings = prefs.getString(kMeetingsPrefsKey);
     if (rawMeetings != null && rawMeetings.isNotEmpty) {
-      final decoded = jsonDecode(rawMeetings) as Map<String, dynamic>;
-      _zoomConfigs = decoded.map(
-        (k, v) => MapEntry(
-          k,
-          ZoomAccessConfig.fromJson(v as Map<String, dynamic>),
-        ),
-      );
+      try {
+        final decoded = jsonDecode(rawMeetings) as Map<String, dynamic>;
+        _zoomConfigs = decoded.map(
+          (k, v) => MapEntry(
+            k,
+            ZoomAccessConfig.fromJson(v as Map<String, dynamic>),
+          ),
+        );
+      } catch (_) {}
     }
 
+    final cachedLessons = _collectCachedLessons(prefs);
     final localTeachers = <String>{};
-    for (final key in prefs.getKeys()) {
-      if (key.startsWith('ukrduzt_schedule_cache_')) {
-        final raw = prefs.getString(key);
-        if (raw != null && raw.isNotEmpty) {
-          for (final item in (jsonDecode(raw) as List<dynamic>)) {
-            final t = (item as Map<String, dynamic>)['teacher']?.toString().trim();
-            if (t != null && t.isNotEmpty) localTeachers.add(t);
-          }
-        }
-      }
+    for (final lesson in cachedLessons) {
+      final t = (lesson.teacher ?? '').trim();
+      if (t.isNotEmpty) localTeachers.add(t);
     }
 
     if (mounted) {
@@ -77,16 +89,14 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
     try {
       final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/teachers');
       final resp = await http.get(uri).timeout(const Duration(seconds: 8));
-      if (resp.statusCode == 200) {
+      if (resp.statusCode == 200 && mounted) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
         final apiTeachers = (data['teachers'] as List<dynamic>? ?? [])
             .map((e) => e.toString().trim())
             .where((e) => e.isNotEmpty)
             .toSet();
         apiTeachers.addAll(localTeachers);
-        if (mounted) {
-          setState(() => _allTeachers = apiTeachers.toList()..sort());
-        }
+        setState(() => _allTeachers = apiTeachers.toList()..sort());
       }
     } catch (_) {}
   }
@@ -141,20 +151,9 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
       final prefs = await SharedPreferences.getInstance();
       if (!mounted || seq != _searchSeq) return;
       final qLower = cleaned.toLowerCase();
-      final fallback = <LessonModel>[];
-
-      for (final key in prefs.getKeys()) {
-        if (key.startsWith('ukrduzt_schedule_cache_')) {
-          final raw = prefs.getString(key);
-          if (raw == null || raw.isEmpty) continue;
-          for (final e in (jsonDecode(raw) as List<dynamic>)) {
-            final lesson = LessonModel.fromJson(e as Map<String, dynamic>);
-            if ((lesson.teacher ?? '').toLowerCase().contains(qLower)) {
-              fallback.add(lesson);
-            }
-          }
-        }
-      }
+      final fallback = _collectCachedLessons(prefs)
+          .where((lesson) => (lesson.teacher ?? '').toLowerCase().contains(qLower))
+          .toList();
 
       setState(() {
         _results = fallback;
@@ -324,9 +323,10 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
                               final meta = <String>[
                                 'Група ${item.group}',
                                 '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
-                                'Онлайн',
-                                if (item.lessonType != null) item.lessonType!,
-                                if (item.teacher != null) item.teacher!,
+                                if (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
+                                  item.lessonType!.trim(),
+                                if (item.teacher != null && item.teacher!.trim().isNotEmpty)
+                                  item.teacher!.trim(),
                               ];
 
                               return Card(
