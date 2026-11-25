@@ -26,7 +26,14 @@ _last_sync_stats: dict[str, Any] | None = None
 _last_sync_error: str | None = None
 
 
-def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
+def _normalize_query_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = " ".join(value.split()).strip()
+    return cleaned or None
+
+
+def _execute_sync_safe() -> dict[str, Any] | None:
     global _sync_in_progress, _last_sync_stats, _last_sync_error
 
     if not _sync_lock.acquire(blocking=False):
@@ -34,7 +41,7 @@ def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
 
     _sync_in_progress = True
     try:
-        stats = run_sync(force=force)
+        stats = run_sync()
         _last_sync_stats = stats
         _last_sync_error = None
         logger.info("Schedule sync finished: %s", stats)
@@ -51,7 +58,7 @@ def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
 async def background_sync_loop() -> None:
     while True:
         try:
-            await asyncio.to_thread(_execute_sync_safe, False)
+            await asyncio.to_thread(_execute_sync_safe)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -103,48 +110,63 @@ def get_changes(limit: int = Query(20, ge=1, le=100)):
 
 @app.get("/api/v1/schedule")
 def get_schedule(
-    group: str | None = Query(None, description="Наприклад: 101-ЛЛГ-326 або потік"),
+    group: str | None = Query(None, description="Наприклад: 101-ЛЛГ-з26 або потік"),
     teacher: str | None = Query(None, description="Частина ПІБ викладача"),
     date: str | None = Query(None, description="Формат ДД.ММ.РРРР"),
 ):
-    clean_group = group.strip() if group else None
-    clean_teacher = teacher.strip() if teacher else None
-    clean_date = date.strip() if date else None
+    clean_group = _normalize_query_text(group)
+    clean_teacher = _normalize_query_text(teacher)
+    clean_date = _normalize_query_text(date)
 
     if not any([clean_group, clean_teacher]):
         raise HTTPException(
             status_code=400, detail="Вкажіть хоча б один параметр: group або teacher"
         )
+
     items = query_lessons(
         group=clean_group,
         teacher=clean_teacher,
         date=clean_date,
     )
+
+    if not items and clean_teacher and "." in clean_teacher:
+        surname_only = clean_teacher.split()[0]
+        if len(surname_only) >= 3:
+            candidate_items = query_lessons(
+                group=clean_group,
+                teacher=surname_only,
+                date=clean_date,
+            )
+            norm_target = clean_teacher.lower().replace(" ", "")
+            items = [
+                item
+                for item in candidate_items
+                if norm_target in (item.get("teacher") or "").lower().replace(" ", "")
+            ]
+
     if not items:
         raise HTTPException(status_code=404, detail="Розклад не знайдено")
     return {"items": items}
 
 
 @app.post("/api/v1/sync")
-def trigger_sync(force: bool = Query(False, description="Примусово перепарсити всі файли")):
+def trigger_sync():
     if _sync_in_progress:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
                 "status": "already_running",
-                "force": force,
                 "last_stats": _last_sync_stats,
                 "last_error": _last_sync_error,
             },
         )
 
-    thread = threading.Thread(target=_execute_sync_safe, args=(force,), daemon=True)
+    thread = threading.Thread(target=_execute_sync_safe, daemon=True)
     thread.start()
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
             "status": "started",
-            "force": force,
             "last_stats": _last_sync_stats,
             "last_error": _last_sync_error,
         },
