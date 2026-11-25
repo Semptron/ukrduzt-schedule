@@ -1,5 +1,6 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 import re
 import pdfplumber
 
@@ -40,7 +41,13 @@ WEEKDAY_RE = re.compile(
 )
 HEADER_NOISE_RE = re.compile(
     r"^(?:затверджую|ректор\s+укрдузт|с\.\s*в\.\s*панченко|розклад\s+занять|"
-    r"навчальний\s+рік|механіко-енергетичний|заступник\s+декана|рукавішников)",
+    r"навчальний\s+рік|механіко-енергетичний|заступник\s+декана|рукавішников|"
+    r"[ІI1]\s+курс|[ІI1]{2}\s+курс|[ІI1]{3}\s+курс|[ІI1]{4}\s+курс|"
+    r"\d\s+курс|семестр|факультет|інститут)",
+    re.IGNORECASE,
+)
+FRAGMENT_NOISE_RE = re.compile(
+    r"^(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лк|пр|лаб)$",
     re.IGNORECASE,
 )
 
@@ -231,7 +238,18 @@ def detect_lesson_number(row: list[str | None], fallback_counter: int) -> int:
 
 
 def _normalize_date_parts(day: str, month: str, year: str) -> str:
-    return f"{int(day):02d}.{month}.{year}"
+    return f"{int(day):02d}.{int(month):02d}.{year}"
+
+
+def _extract_year_from_filename(pdf_path: str) -> str | None:
+    name = Path(pdf_path).name
+    full_years = re.findall(r"\b(202[4-9]|203\d)\b", name)
+    if full_years:
+        return full_years[-1]
+    short_range = re.search(r"\b(2[4-9])-(2[5-9]|30)\b", name)
+    if short_range:
+        return f"20{short_range.group(2)}"
+    return None
 
 
 def _infer_year_for_month(month_num: int, fallback_year: str | None = None) -> str:
@@ -280,7 +298,7 @@ def _extract_groups_from_text(text: str) -> list[str]:
 def _looks_like_lesson_line(line: str) -> bool:
     if not line or len(line) < 4:
         return False
-    if WEEKDAY_RE.match(line) or HEADER_NOISE_RE.match(line):
+    if WEEKDAY_RE.match(line) or HEADER_NOISE_RE.match(line) or FRAGMENT_NOISE_RE.match(line):
         return False
     if DATE_RE.fullmatch(line) or LESSON_NUM_RE.fullmatch(line):
         return False
@@ -315,7 +333,11 @@ def parse_cell_to_lesson(
         return None
     if DATE_RE.fullmatch(cleaned) or LESSON_NUM_RE.fullmatch(cleaned):
         return None
-    if WEEKDAY_RE.match(cleaned) or HEADER_NOISE_RE.match(cleaned):
+    if (
+        WEEKDAY_RE.match(cleaned)
+        or HEADER_NOISE_RE.match(cleaned)
+        or FRAGMENT_NOISE_RE.match(cleaned)
+    ):
         return None
 
     type_match = LESSON_TYPE_RE.search(cleaned)
@@ -332,7 +354,17 @@ def parse_cell_to_lesson(
     )
 
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    subject = parts[0] if parts else cleaned
+    first_part = parts[0] if parts else cleaned
+
+    if FRAGMENT_NOISE_RE.match(first_part) and len(parts) > 1:
+        subject = parts[1]
+        if not lesson_type:
+            lesson_type = first_part.lower()
+    elif FRAGMENT_NOISE_RE.match(first_part):
+        subject = lesson_type or "Заняття"
+    else:
+        subject = first_part
+
     teacher = _extract_teacher_from_parts(parts, cleaned)
 
     if not lesson_type or (not room and not meeting_url):
@@ -436,8 +468,10 @@ def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
     )
     meeting_password = zoom_pass_match.group(1).strip() if zoom_pass_match else None
 
-    year_match = re.search(r"\b(202[4-9]|203\d)\b", joined)
-    fallback_year = year_match.group(1) if year_match else str(datetime.now().year)
+    fallback_year = _extract_year_from_filename(pdf_path)
+    if not fallback_year:
+        years_in_text = re.findall(r"\b(202[4-9]|203\d)\b", joined)
+        fallback_year = years_in_text[-1] if years_in_text else str(datetime.now().year)
 
     current_teacher: str | None = None
     current_date: str | None = None
@@ -533,16 +567,16 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
     results: list[LessonItem] = []
     warnings: list[ParseWarning] = []
     current_date: str | None = None
-    fallback_year: str | None = None
+    fallback_year: str | None = _extract_year_from_filename(pdf_path)
     lesson_counter = 0
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             page_txt = page.extract_text() or ""
             if not fallback_year:
-                ym = re.search(r"\b(202[4-9]|203\d)\b", page_txt)
-                if ym:
-                    fallback_year = ym.group(1)
+                years_in_page = re.findall(r"\b(202[4-9]|203\d)\b", page_txt)
+                if years_in_page:
+                    fallback_year = years_in_page[-1]
 
             page_groups = _extract_groups_from_text(page_txt)
             group_columns: dict[int, str] = {}
