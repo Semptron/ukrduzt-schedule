@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -23,12 +23,14 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          cache: true
 
       - name: Create Flutter project and copy app files
         run: |
           flutter create --org ua.edu.kart.schedule ukrduzt_app
           rm -f ukrduzt_app/test/widget_test.dart
-          cp flutter/*.dart ukrduzt_app/lib/
+          rm -rf ukrduzt_app/lib/*
+          cp -r flutter/. ukrduzt_app/lib/
 
       - name: Configure pubspec.yaml
         run: |
@@ -55,7 +57,10 @@ jobs:
           text = p.read_text(encoding="utf-8")
           if "android.permission.INTERNET" not in text:
               perm = "    <uses-permission android:name=\"android.permission.INTERNET\" />\n"
-              text = re.sub(r"(<application\b)", perm + r"\1", text, count=1)
+              if re.search(r"<manifest\b[^>]*>\s*\n", text):
+                  text = re.sub(r"(<manifest\b[^>]*>\s*\n)", r"\1" + perm, text, count=1)
+              else:
+                  text = re.sub(r"(<application\b)", perm + r"\1", text, count=1)
           p.write_text(text, encoding="utf-8")
           '
 
@@ -70,7 +75,7 @@ jobs:
         run: flutter build apk --release
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ukrduzt-schedule-apk
           path: ukrduzt_app/build/app/outputs/flutter-apk/app-release.apk
