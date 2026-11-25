@@ -10,12 +10,12 @@ GROUP_RE = re.compile(
     r"[A-Za-zА-Яа-яІіЇїЄєҐґ]{2,8}-\d{2,4}(?:-[A-Za-zА-Яа-яІіЇїЄєҐґ0-9]{1,6})?)"
     r"(?![A-Za-zА-Яа-яІіЇїЄєҐґ0-9_])"
 )
-DATE_RE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
+DATE_RE = re.compile(r"\b\d{1,2}\.\d{2}\.\d{4}\b")
 NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{2})\.(\d{4})\b")
 SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\.\d|\d)")
 LESSON_NUM_RE = re.compile(r"^[1-8]$")
 LESSON_TYPE_RE = re.compile(
-    r"\b(лк|пр|лаб|лік|інд\.?\s*конс\.?|конс\.?|лекц\w*|практ\w*|лаб\w*)\b\.?",
+    r"\b(лк|пр|лаб|лік|лек|інд\.?\s*конс\.?|конс\.?|лекц\w*|практ\w*|лаб\w*)\b\.?",
     re.IGNORECASE,
 )
 ROOM_RE = re.compile(r"\b\d+\.[А-ЯІЇЄҐA-Z0-9]+\b")
@@ -33,7 +33,7 @@ ZOOM_PASS_RE = re.compile(
     r"(?:код\s*доступу|пароль|passcode)[^:\w]*:\s*([A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
-SUBJECT_QUOTES_RE = re.compile(r"[«\"]([^»\"]+)[»\"]")
+SUBJECT_QUOTES_RE = re.compile(r'[«"]([^»"]+)[»"]')
 
 WEEKDAY_RE = re.compile(
     r"^(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)$",
@@ -47,20 +47,20 @@ HEADER_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 FRAGMENT_NOISE_RE = re.compile(
-    r"^(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лк|пр|лаб)$",
+    r"^(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|экз\.?|залік|м|лк|пр|лаб|лік|лек)$",
     re.IGNORECASE,
 )
 GARBAGE_SUBJECT_RE = re.compile(
-    r"^(?:інд|ирап|пари|пар|інд\.?\s*конс\.?|конс\.?|екз\.?|залік)$",
+    r"^(?:інд|ирап|пари|пар|інд\.?\s*конс\.?|конс\.?|екз\.?|экз\.?|залік)$",
     re.IGNORECASE,
 )
 
 TEACHER_NOISE_TAIL_RE = re.compile(
-    r"(?:,?\s*\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лекц\w*|практ\w*|лаб\w*)\b\.?)+$",
+    r"(?:,?\s*\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|экз\.?|залік|м|лекц\w*|практ\w*|лаб\w*|лек)\b\.?)+$",
     re.IGNORECASE,
 )
 TEACHER_NOISE_HEAD_RE = re.compile(
-    r"^(?:\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|лекц\w*|практ\w*|лаб\w*)\b\.?[,:\s-]+)+",
+    r"^(?:\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|экз\.?|залік|лекц\w*|практ\w*|лаб\w*|лек)\b\.?[,:\s-]+)+",
     re.IGNORECASE,
 )
 TEACHER_EXACT_NOISE = {
@@ -69,6 +69,8 @@ TEACHER_EXACT_NOISE = {
     "м",
     "екз.",
     "екз",
+    "экз.",
+    "экз",
     "інд. конс.",
     "інд. конс",
     "інд конс",
@@ -175,11 +177,21 @@ def clean_cell(text: str | None) -> str:
     return " ".join(lines).strip()
 
 
+def _fix_ocr_initials(text: str) -> str:
+    fixed = text.replace("Ο.", "О.")
+    fixed = re.sub(
+        r"(\b[А-ЯІЇЄҐ][а-яіїєґ'’`-]+\s+[А-ЯІЇЄҐ]\.\s*)[L1I]\b\.?",
+        r"\1І.",
+        fixed,
+    )
+    return fixed
+
+
 def normalize_teacher_name(raw_teacher: str | None) -> str | None:
     if not raw_teacher:
         return None
 
-    cleaned = re.sub(r"\s+", " ", raw_teacher).strip(" ,;|")
+    cleaned = _fix_ocr_initials(re.sub(r"\s+", " ", raw_teacher)).strip(" ,;|")
     if not cleaned:
         return None
 
@@ -229,6 +241,7 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
         return cleaned
 
     return None
+
 
 def detect_lesson_number(row: list[str | None], fallback_counter: int) -> int:
     for cell in row:
@@ -318,11 +331,22 @@ def _is_date_header_line(line: str) -> bool:
         return False
     if DATE_RE.fullmatch(s) or TEXT_DATE_RE.fullmatch(s):
         return True
-    stripped = re.sub(r"\b\d{2}\.\d{2}\.\d{4}\b", "", s)
+    stripped = re.sub(r"\b\d{1,2}\.\d{2}\.\d{4}\b", "", s)
     stripped = TEXT_DATE_RE.sub("", stripped)
     stripped = WEEKDAY_RE.sub("", stripped.strip())
     stripped = re.sub(r"[\s,.;:|()\-–]+", "", stripped)
     return bool(_extract_full_dates_from_text(s) and len(stripped) == 0)
+
+
+def _strip_leading_date_or_weekday(text: str) -> str:
+    s = re.sub(r"^\s*\d{1,2}\.\d{2}\.\d{4}\s*[,.;:|()\-–]*\s*", "", text)
+    s = re.sub(
+        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)\s*[,.;:|()\-–]*\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return s.strip()
 
 
 def _extract_groups_from_text(text: str) -> list[str]:
@@ -393,7 +417,7 @@ def parse_cell_to_lesson(
     raw_text: str,
     warnings: list[ParseWarning],
 ) -> LessonItem | None:
-    cleaned = clean_cell(raw_text)
+    cleaned = _strip_leading_date_or_weekday(clean_cell(raw_text))
     if not cleaned:
         return None
     if _is_date_header_line(cleaned):
