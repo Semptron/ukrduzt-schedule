@@ -145,12 +145,12 @@ class LessonModel {
         );
 
     return LessonModel(
-      date: (json['date'] ?? '').toString(),
-      group: (json['group'] ?? '').toString(),
+      date: (json['date'] ?? '').toString().trim(),
+      group: (json['group'] ?? '').toString().trim(),
       lessonNumber: lessonNum,
       timeStart: (json['time_start'] as String?) ?? bell?.start ?? '00:00',
       timeEnd: (json['time_end'] as String?) ?? bell?.end ?? '00:00',
-      subject: (json['subject'] ?? 'Без назви').toString(),
+      subject: (json['subject'] ?? 'Без назви').toString().trim(),
       lessonType: json['lesson_type'] as String?,
       teacher: json['teacher'] as String?,
       serverMeetingUrl: json['meeting_url'] as String?,
@@ -193,6 +193,19 @@ String _formatDateDdMmYyyy(DateTime dt) {
   return '$d.$m.$y';
 }
 
+DateTime? _tryParseDdMmYyyy(String raw) {
+  final parts = raw.trim().split('.');
+  if (parts.length != 3) return null;
+  final d = int.tryParse(parts[0]);
+  final m = int.tryParse(parts[1]);
+  final y = int.tryParse(parts[2]);
+  if (d == null || m == null || y == null) return null;
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  return DateTime(y, m, d);
+}
+
+DateTime _dateOnly(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
 class ScheduleScreen extends StatefulWidget {
   final String apiBaseUrl;
   final String initialGroup;
@@ -200,7 +213,7 @@ class ScheduleScreen extends StatefulWidget {
   const ScheduleScreen({
     super.key,
     this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
-    this.initialGroup = '101-ЛЛГ-326',
+    this.initialGroup = '101-ЛЛГ-з26',
   });
 
   @override
@@ -225,6 +238,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   void initState() {
     super.initState();
     _selectedGroup = widget.initialGroup;
+    _selectedDate = _formatDateDdMmYyyy(DateTime.now());
     _initScreen();
     _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted) setState(() {});
@@ -276,7 +290,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     if (cachedLessons.isNotEmpty && mounted) {
       setState(() {
         _lessons = cachedLessons;
-        _selectedDate = _pickInitialDate(cachedLessons);
+        _selectedDate ??= _pickInitialDate(cachedLessons);
         _loading = false;
       });
     }
@@ -285,21 +299,44 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     await _fetchSchedule(prefs, showSpinnerIfEmpty: cachedLessons.isEmpty);
   }
 
-  String? _pickInitialDate(List<LessonModel> items) {
-    if (items.isEmpty) return null;
-    final dates = _uniqueDates(items);
-    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+  String _pickInitialDate(List<LessonModel> items) {
+    final today = _dateOnly(DateTime.now());
+    final todayStr = _formatDateDdMmYyyy(today);
+    final dates = _sortedDates(items, fromTodayOnly: true);
     if (dates.contains(todayStr)) return todayStr;
-    return dates.first;
+    if (dates.isNotEmpty) return dates.first;
+    return todayStr;
   }
 
-  List<String> _uniqueDates(List<LessonModel> items) {
+  List<String> _sortedDates(
+    List<LessonModel> items, {
+    bool fromTodayOnly = false,
+  }) {
     final seen = <String>{};
-    final out = <String>[];
+    final parsedEntries = <({String raw, DateTime dt})>[];
+
     for (final item in items) {
-      if (seen.add(item.date)) out.add(item.date);
+      final raw = item.date.trim();
+      if (raw.isEmpty || !seen.add(raw)) continue;
+      final dt = _tryParseDdMmYyyy(raw);
+      if (dt != null) {
+        parsedEntries.add((raw: raw, dt: _dateOnly(dt)));
+      }
     }
-    return out;
+
+    parsedEntries.sort((a, b) => a.dt.compareTo(b.dt));
+
+    final today = _dateOnly(DateTime.now());
+    final filtered = fromTodayOnly
+        ? parsedEntries.where((e) => !e.dt.isBefore(today)).toList()
+        : parsedEntries;
+
+    final result = filtered.map((e) => e.raw).toList();
+    final todayStr = _formatDateDdMmYyyy(today);
+    if (fromTodayOnly && !result.contains(todayStr)) {
+      result.insert(0, todayStr);
+    }
+    return result;
   }
 
   List<LessonModel> _readCachedLessons(SharedPreferences prefs, String group) {
@@ -422,7 +459,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       if (resp.statusCode == 404) {
         setState(() {
           _lessons = [];
-          _selectedDate = null;
+          _selectedDate = _formatDateDdMmYyyy(DateTime.now());
           _loading = false;
           _offlineBanner = false;
           _error =
@@ -446,12 +483,13 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       );
 
       if (!mounted || reqId != _scheduleRequestId) return;
+      final availableDates = _sortedDates(items, fromTodayOnly: false);
       setState(() {
         _lessons = items;
-        _selectedDate =
-            _selectedDate != null && _uniqueDates(items).contains(_selectedDate)
-                ? _selectedDate
-                : _pickInitialDate(items);
+        _selectedDate = (_selectedDate != null &&
+                availableDates.contains(_selectedDate))
+            ? _selectedDate
+            : _pickInitialDate(items);
         _loading = false;
         _offlineBanner = false;
         _error = items.isEmpty
@@ -489,6 +527,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       _selectedGroup = newGroup;
       _lessons = cached;
       _selectedDate = _pickInitialDate(cached);
+      _showAllDates = false;
       _error = null;
       _loading = cached.isEmpty;
     });
@@ -744,7 +783,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   LessonModel? _findActiveOrNextLesson(List<LessonModel> allLessons) {
     final todayStr = _formatDateDdMmYyyy(DateTime.now());
-    final todayItems = allLessons.where((l) => l.date == todayStr).toList();
+    final todayItems = allLessons.where((l) => l.date == todayStr).toList()
+      ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
     if (todayItems.isEmpty) return null;
 
     final now = DateTime.now();
@@ -759,14 +799,31 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     return null;
   }
 
+  List<LessonModel> _buildVisibleLessons(String activeDate) {
+    if (_showAllDates) {
+      final copy = [..._lessons];
+      copy.sort((a, b) {
+        final dtA = _tryParseDdMmYyyy(a.date) ?? DateTime(1970);
+        final dtB = _tryParseDdMmYyyy(b.date) ?? DateTime(1970);
+        final cmp = dtA.compareTo(dtB);
+        if (cmp != 0) return cmp;
+        return a.lessonNumber.compareTo(b.lessonNumber);
+      });
+      return copy;
+    }
+
+    final dayItems = _lessons.where((l) => l.date == activeDate).toList()
+      ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
+    return dayItems;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final dates = _uniqueDates(_lessons);
-    final visibleLessons = _showAllDates || _selectedDate == null
-        ? _lessons
-        : _lessons.where((l) => l.date == _selectedDate).toList();
-    final featuredLesson = _findActiveOrNextLesson(_lessons);
+    final dates = _sortedDates(_lessons, fromTodayOnly: true);
     final todayStr = _formatDateDdMmYyyy(DateTime.now());
+    final activeDate = _selectedDate ?? todayStr;
+    final visibleLessons = _buildVisibleLessons(activeDate);
+    final featuredLesson = _findActiveOrNextLesson(_lessons);
 
     return Scaffold(
       appBar: AppBar(
@@ -840,49 +897,48 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                 ),
               ),
             ),
-          if (dates.isNotEmpty) ...[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-              child: Row(
-                children: [
-                  ActionChip(
-                    label: const Text('Сьогодні'),
-                    onPressed: dates.contains(todayStr)
-                        ? () => setState(() {
-                              _showAllDates = false;
-                              _selectedDate = todayStr;
-                            })
-                        : null,
-                  ),
-                  const SizedBox(width: 8),
-                  FilterChip(
-                    label: const Text('Усі дні'),
-                    selected: _showAllDates,
-                    onSelected: (val) => setState(() => _showAllDates = val),
-                  ),
-                ],
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              children: [
+                ActionChip(
+                  label: const Text('Сьогодні'),
+                  onPressed: () => setState(() {
+                    _showAllDates = false;
+                    _selectedDate = todayStr;
+                  }),
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('Усі дні'),
+                  selected: _showAllDates,
+                  onSelected: (val) => setState(() => _showAllDates = val),
+                ),
+              ],
+            ),
+          ),
+          if (!_showAllDates && dates.isNotEmpty)
+            SizedBox(
+              height: 48,
+              child: ListView.separated(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                scrollDirection: Axis.horizontal,
+                itemCount: dates.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemBuilder: (context, idx) {
+                  final d = dates[idx];
+                  final selected = d == activeDate;
+                  return ChoiceChip(
+                    label: Text(d == todayStr ? '$d (сьогодні)' : d),
+                    selected: selected,
+                    onSelected: (_) => setState(() {
+                      _showAllDates = false;
+                      _selectedDate = d;
+                    }),
+                  );
+                },
               ),
             ),
-            if (!_showAllDates)
-              SizedBox(
-                height: 48,
-                child: ListView.separated(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  scrollDirection: Axis.horizontal,
-                  itemCount: dates.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 8),
-                  itemBuilder: (context, idx) {
-                    final d = dates[idx];
-                    final selected = d == _selectedDate;
-                    return ChoiceChip(
-                      label: Text(d),
-                      selected: selected,
-                      onSelected: (_) => setState(() => _selectedDate = d),
-                    );
-                  },
-                ),
-              ),
-          ],
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -893,134 +949,161 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                           child: Text(_error!, textAlign: TextAlign.center),
                         ),
                       )
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(12),
-                        itemCount: visibleLessons.length,
-                        itemBuilder: (context, index) {
-                          final item = visibleLessons[index];
-                          final zoomCfg = _getZoomConfig(item);
-                          final note = _lessonNotes[buildNoteKey(item)];
-                          final metaParts = <String>[
-                            '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
-                            'Онлайн',
-                            if (item.lessonType != null) item.lessonType!,
-                            if (item.teacher != null) item.teacher!,
-                          ];
-
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 10),
+                    : visibleLessons.isEmpty
+                        ? Center(
                             child: Padding(
-                              padding: const EdgeInsets.all(12),
+                              padding: const EdgeInsets.all(24),
                               child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
+                                  const Icon(Icons.event_available, size: 48),
+                                  const SizedBox(height: 12),
                                   Text(
-                                    item.subject,
+                                    'Цього дня ($activeDate) ви вільні',
                                     style: const TextStyle(
                                       fontSize: 16,
                                       fontWeight: FontWeight.w600,
                                     ),
+                                    textAlign: TextAlign.center,
                                   ),
-                                  const SizedBox(height: 4),
-                                  Text('${item.date} \u2022 ${metaParts.join(' \u2022 ')}'),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    _liveStatusText(item),
-                                    style: Theme.of(context).textTheme.bodySmall,
-                                  ),
-                                  if (zoomCfg != null &&
-                                      zoomCfg.mode == 'credentials') ...[
-                                    const SizedBox(height: 8),
-                                    Wrap(
-                                      spacing: 8,
-                                      runSpacing: 6,
-                                      children: [
-                                        if ((zoomCfg.meetingCode ?? '').isNotEmpty)
-                                          ActionChip(
-                                            avatar: const Icon(Icons.copy, size: 16),
-                                            label: Text('Код: ${zoomCfg.meetingCode}'),
-                                            onPressed: () => _copyText(
-                                              'Код конференції',
-                                              zoomCfg.meetingCode!,
-                                            ),
-                                          ),
-                                        if ((zoomCfg.password ?? '').isNotEmpty)
-                                          ActionChip(
-                                            avatar: const Icon(Icons.copy, size: 16),
-                                            label: Text('Пароль: ${zoomCfg.password}'),
-                                            onPressed: () => _copyText(
-                                              'Пароль конференції',
-                                              zoomCfg.password!,
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  ],
-                                  if (note != null && note.isNotEmpty) ...[
-                                    const SizedBox(height: 6),
-                                    Container(
-                                      width: double.infinity,
-                                      padding: const EdgeInsets.all(8),
-                                      decoration: BoxDecoration(
-                                        color: Theme.of(context)
-                                            .colorScheme
-                                            .surfaceContainerHighest,
-                                        borderRadius: BorderRadius.circular(8),
-                                      ),
-                                      child: Text('Нотатка: $note'),
-                                    ),
-                                  ],
-                                  const SizedBox(height: 10),
-                                  Wrap(
-                                    spacing: 8,
-                                    runSpacing: 8,
-                                    children: [
-                                      if (zoomCfg != null)
-                                        FilledButton.icon(
-                                          onPressed: () => _launchZoom(zoomCfg),
-                                          icon: const Icon(Icons.videocam, size: 18),
-                                          label: const Text('Увійти в Zoom'),
-                                        ),
-                                      OutlinedButton.icon(
-                                        onPressed: () => _showZoomDialog(item),
-                                        icon: Icon(
-                                          zoomCfg == null
-                                              ? Icons.add_link
-                                              : Icons.edit,
-                                          size: 18,
-                                        ),
-                                        label: Text(
-                                          zoomCfg == null
-                                              ? 'Додати Zoom з Moodle'
-                                              : 'Змінити Zoom',
-                                        ),
-                                      ),
-                                      OutlinedButton.icon(
-                                        onPressed: () => _showNoteDialog(item),
-                                        icon: const Icon(
-                                          Icons.note_add_outlined,
-                                          size: 18,
-                                        ),
-                                        label: Text(
-                                          note == null || note.isEmpty
-                                              ? 'Нотатка'
-                                              : 'Змінити нотатку',
-                                        ),
-                                      ),
-                                      if (zoomCfg == null)
-                                        TextButton.icon(
-                                          onPressed: () => _openExternalUrl(kMoodleUrl),
-                                          icon: const Icon(Icons.open_in_new, size: 18),
-                                          label: const Text('Moodle'),
-                                        ),
-                                    ],
+                                  const SizedBox(height: 12),
+                                  OutlinedButton(
+                                    onPressed: () =>
+                                        setState(() => _showAllDates = true),
+                                    child: const Text('Показати всі дні'),
                                   ),
                                 ],
                               ),
                             ),
-                          );
-                        },
-                      ),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.all(12),
+                            itemCount: visibleLessons.length,
+                            itemBuilder: (context, index) {
+                              final item = visibleLessons[index];
+                              final zoomCfg = _getZoomConfig(item);
+                              final note = _lessonNotes[buildNoteKey(item)];
+                              final metaParts = <String>[
+                                '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
+                                'Онлайн',
+                                if (item.lessonType != null) item.lessonType!,
+                                if (item.teacher != null) item.teacher!,
+                              ];
+
+                              return Card(
+                                margin: const EdgeInsets.only(bottom: 10),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        item.subject,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text('${item.date} \u2022 ${metaParts.join(' \u2022 ')}'),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        _liveStatusText(item),
+                                        style: Theme.of(context).textTheme.bodySmall,
+                                      ),
+                                      if (zoomCfg != null &&
+                                          zoomCfg.mode == 'credentials') ...[
+                                        const SizedBox(height: 8),
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 6,
+                                          children: [
+                                            if ((zoomCfg.meetingCode ?? '').isNotEmpty)
+                                              ActionChip(
+                                                avatar: const Icon(Icons.copy, size: 16),
+                                                label: Text('Код: ${zoomCfg.meetingCode}'),
+                                                onPressed: () => _copyText(
+                                                  'Код конференції',
+                                                  zoomCfg.meetingCode!,
+                                                ),
+                                              ),
+                                            if ((zoomCfg.password ?? '').isNotEmpty)
+                                              ActionChip(
+                                                avatar: const Icon(Icons.copy, size: 16),
+                                                label: Text('Пароль: ${zoomCfg.password}'),
+                                                onPressed: () => _copyText(
+                                                  'Пароль конференції',
+                                                  zoomCfg.password!,
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      ],
+                                      if (note != null && note.isNotEmpty) ...[
+                                        const SizedBox(height: 6),
+                                        Container(
+                                          width: double.infinity,
+                                          padding: const EdgeInsets.all(8),
+                                          decoration: BoxDecoration(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .surfaceContainerHighest,
+                                            borderRadius: BorderRadius.circular(8),
+                                          ),
+                                          child: Text('Нотатка: $note'),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 10),
+                                      Wrap(
+                                        spacing: 8,
+                                        runSpacing: 8,
+                                        children: [
+                                          if (zoomCfg != null)
+                                            FilledButton.icon(
+                                              onPressed: () => _launchZoom(zoomCfg),
+                                              icon: const Icon(Icons.videocam, size: 18),
+                                              label: const Text('Увійти в Zoom'),
+                                            ),
+                                          OutlinedButton.icon(
+                                            onPressed: () => _showZoomDialog(item),
+                                            icon: Icon(
+                                              zoomCfg == null
+                                                  ? Icons.add_link
+                                                  : Icons.edit,
+                                              size: 18,
+                                            ),
+                                            label: Text(
+                                              zoomCfg == null
+                                                  ? 'Додати Zoom з Moodle'
+                                                  : 'Змінити Zoom',
+                                            ),
+                                          ),
+                                          OutlinedButton.icon(
+                                            onPressed: () => _showNoteDialog(item),
+                                            icon: const Icon(
+                                              Icons.note_add_outlined,
+                                              size: 18,
+                                            ),
+                                            label: Text(
+                                              note == null || note.isEmpty
+                                                  ? 'Нотатка'
+                                                  : 'Змінити нотатку',
+                                            ),
+                                          ),
+                                          if (zoomCfg == null)
+                                            TextButton.icon(
+                                              onPressed: () => _openExternalUrl(kMoodleUrl),
+                                              icon: const Icon(Icons.open_in_new, size: 18),
+                                              label: const Text('Moodle'),
+                                            ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
           ),
         ],
       ),
