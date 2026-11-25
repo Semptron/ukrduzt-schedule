@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+from parser import normalize_teacher_name
 
 DB_PATH = Path("data/schedule.db")
 
@@ -126,7 +127,7 @@ def replace_source_lessons(
                     item["subject"].strip(),
                     item.get("room"),
                     item.get("lesson_type"),
-                    item.get("teacher"),
+                    normalize_teacher_name(item.get("teacher")),
                     item.get("meeting_url"),
                     item.get("meeting_code"),
                     item.get("meeting_password"),
@@ -180,7 +181,12 @@ def list_teachers() -> list[str]:
             ORDER BY teacher
             """
         ).fetchall()
-        return [r["teacher"] for r in rows]
+        cleaned = {
+            norm
+            for r in rows
+            if (norm := normalize_teacher_name(r["teacher"])) is not None
+        }
+        return sorted(cleaned)
 
 
 def query_lessons(
