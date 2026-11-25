@@ -1,0 +1,12 @@
+services:
+  ukrduzt-schedule-api:
+    build: .
+    container_name: ukrduzt-schedule-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+    environment:
+      - PYTHONUNBUFFERED=1
