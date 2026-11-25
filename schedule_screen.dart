@@ -1,0 +1,954 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+const String kMoodleUrl = 'https://do.kart.edu.ua/';
+const String kZoomAppUrl = 'https://zoom.us/join';
+const String kMeetingsPrefsKey = 'ukrduzt_zoom_configs_v1';
+const String kNotesPrefsKey = 'ukrduzt_lesson_notes_v1';
+const String kSelectedGroupPrefsKey = 'ukrduzt_selected_group_v1';
+const String kGroupsCachePrefsKey = 'ukrduzt_groups_cache_v1';
+
+String _scheduleCacheKey(String group) => 'ukrduzt_schedule_cache_$group';
+
+class BellSlot {
+  final int number;
+  final String start;
+  final String end;
+
+  const BellSlot({required this.number, required this.start, required this.end});
+}
+
+const List<BellSlot> kBells = [
+  BellSlot(number: 1, start: '09:00', end: '10:20'),
+  BellSlot(number: 2, start: '10:30', end: '11:50'),
+  BellSlot(number: 3, start: '12:00', end: '13:20'),
+  BellSlot(number: 4, start: '13:40', end: '15:00'),
+  BellSlot(number: 5, start: '15:10', end: '16:30'),
+  BellSlot(number: 6, start: '16:40', end: '18:00'),
+  BellSlot(number: 7, start: '18:10', end: '19:30'),
+  BellSlot(number: 8, start: '19:40', end: '21:00'),
+];
+
+class ZoomAccessConfig {
+  final String mode;
+  final String? url;
+  final String? meetingCode;
+  final String? password;
+
+  const ZoomAccessConfig({
+    required this.mode,
+    this.url,
+    this.meetingCode,
+    this.password,
+  });
+
+  bool get hasAnyData {
+    if (mode == 'credentials') {
+      return (meetingCode ?? '').trim().isNotEmpty ||
+          (password ?? '').trim().isNotEmpty;
+    }
+    return (url ?? '').trim().isNotEmpty;
+  }
+
+  Map<String, dynamic> toJson() => {
+        'mode': mode,
+        'url': url,
+        'meeting_code': meetingCode,
+        'password': password,
+      };
+
+  factory ZoomAccessConfig.fromJson(Map<String, dynamic> json) {
+    return ZoomAccessConfig(
+      mode: (json['mode'] as String?) ?? 'link',
+      url: json['url'] as String?,
+      meetingCode: json['meeting_code'] as String?,
+      password: json['password'] as String?,
+    );
+  }
+}
+
+class LessonModel {
+  final String date;
+  final String group;
+  final int lessonNumber;
+  final String timeStart;
+  final String timeEnd;
+  final String subject;
+  final String? lessonType;
+  final String? teacher;
+  final String? serverMeetingUrl;
+  final String? serverMeetingCode;
+  final String? serverMeetingPassword;
+
+  LessonModel({
+    required this.date,
+    required this.group,
+    required this.lessonNumber,
+    required this.timeStart,
+    required this.timeEnd,
+    required this.subject,
+    this.lessonType,
+    this.teacher,
+    this.serverMeetingUrl,
+    this.serverMeetingCode,
+    this.serverMeetingPassword,
+  });
+
+  factory LessonModel.fromJson(Map<String, dynamic> json) {
+    final lessonNum = json['lesson_number'] as int;
+    final bell = kBells.cast<BellSlot?>().firstWhere(
+          (b) => b?.number == lessonNum,
+          orElse: () => null,
+        );
+
+    return LessonModel(
+      date: json['date'] as String,
+      group: json['group'] as String,
+      lessonNumber: lessonNum,
+      timeStart: (json['time_start'] as String?) ?? bell?.start ?? '00:00',
+      timeEnd: (json['time_end'] as String?) ?? bell?.end ?? '00:00',
+      subject: json['subject'] as String,
+      lessonType: json['lesson_type'] as String?,
+      teacher: json['teacher'] as String?,
+      serverMeetingUrl: json['meeting_url'] as String?,
+      serverMeetingCode: json['meeting_code'] as String?,
+      serverMeetingPassword: json['meeting_password'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'date': date,
+        'group': group,
+        'lesson_number': lessonNumber,
+        'time_start': timeStart,
+        'time_end': timeEnd,
+        'subject': subject,
+        'lesson_type': lessonType,
+        'teacher': teacher,
+        'meeting_url': serverMeetingUrl,
+        'meeting_code': serverMeetingCode,
+        'meeting_password': serverMeetingPassword,
+      };
+}
+
+String buildMeetingKey({required String subject, String? teacher}) {
+  final normSubject = subject.trim().toLowerCase();
+  final normTeacher = (teacher ?? '').trim().toLowerCase();
+  return '$normSubject|$normTeacher';
+}
+
+String buildNoteKey(LessonModel lesson) {
+  final normSubject = lesson.subject.trim().toLowerCase();
+  final normTeacher = (lesson.teacher ?? '').trim().toLowerCase();
+  return '${lesson.date}|$normSubject|$normTeacher|${lesson.lessonNumber}';
+}
+
+String _formatDateDdMmYyyy(DateTime dt) {
+  final d = dt.day.toString().padLeft(2, '0');
+  final m = dt.month.toString().padLeft(2, '0');
+  final y = dt.year.toString();
+  return '$d.$m.$y';
+}
+
+class ScheduleScreen extends StatefulWidget {
+  final String apiBaseUrl;
+  final String initialGroup;
+
+  const ScheduleScreen({
+    super.key,
+    this.apiBaseUrl = 'http://10.0.2.2:8000',
+    this.initialGroup = '101-ЛЛГ-326',
+  });
+
+  @override
+  State<ScheduleScreen> createState() => _ScheduleScreenState();
+}
+
+class _ScheduleScreenState extends State<ScheduleScreen> {
+  late String _selectedGroup;
+  String? _selectedDate;
+  bool _showAllDates = false;
+  List<String> _groups = [];
+  List<LessonModel> _lessons = [];
+  Map<String, ZoomAccessConfig> _zoomConfigs = {};
+  Map<String, String> _lessonNotes = {};
+  bool _loading = true;
+  bool _offlineBanner = false;
+  String? _error;
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedGroup = widget.initialGroup;
+    _initScreen();
+    _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _initScreen() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final savedGroup = prefs.getString(kSelectedGroupPrefsKey);
+    if (savedGroup != null && savedGroup.isNotEmpty) {
+      _selectedGroup = savedGroup;
+    }
+
+    final rawMeetings = prefs.getString(kMeetingsPrefsKey);
+    if (rawMeetings != null && rawMeetings.isNotEmpty) {
+      final decoded = jsonDecode(rawMeetings) as Map<String, dynamic>;
+      _zoomConfigs = decoded.map(
+        (k, v) => MapEntry(
+          k,
+          ZoomAccessConfig.fromJson(v as Map<String, dynamic>),
+        ),
+      );
+    }
+
+    final rawNotes = prefs.getString(kNotesPrefsKey);
+    if (rawNotes != null && rawNotes.isNotEmpty) {
+      final decoded = jsonDecode(rawNotes) as Map<String, dynamic>;
+      _lessonNotes = decoded.map((k, v) => MapEntry(k, v.toString()));
+    }
+
+    final rawGroups = prefs.getString(kGroupsCachePrefsKey);
+    if (rawGroups != null && rawGroups.isNotEmpty) {
+      _groups = List<String>.from(jsonDecode(rawGroups) as List<dynamic>);
+    }
+    if (!_groups.contains(_selectedGroup)) {
+      _groups = [_selectedGroup, ..._groups];
+    }
+
+    final cachedLessons = _readCachedLessons(prefs, _selectedGroup);
+    if (cachedLessons.isNotEmpty) {
+      setState(() {
+        _lessons = cachedLessons;
+        _selectedDate = _pickInitialDate(cachedLessons);
+        _loading = false;
+      });
+    }
+
+    await Future.wait([
+      _fetchGroups(prefs),
+      _fetchSchedule(prefs, showSpinnerIfEmpty: cachedLessons.isEmpty),
+    ]);
+  }
+
+  String? _pickInitialDate(List<LessonModel> items) {
+    if (items.isEmpty) return null;
+    final dates = _uniqueDates(items);
+    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+    if (dates.contains(todayStr)) return todayStr;
+    return dates.first;
+  }
+
+  List<String> _uniqueDates(List<LessonModel> items) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final item in items) {
+      if (seen.add(item.date)) out.add(item.date);
+    }
+    return out;
+  }
+
+  List<LessonModel> _readCachedLessons(SharedPreferences prefs, String group) {
+    final raw = prefs.getString(_scheduleCacheKey(group));
+    if (raw == null || raw.isEmpty) return [];
+    final list = jsonDecode(raw) as List<dynamic>;
+    return list
+        .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  ZoomAccessConfig? _getZoomConfig(LessonModel lesson) {
+    final key = buildMeetingKey(subject: lesson.subject, teacher: lesson.teacher);
+    final localCfg = _zoomConfigs[key];
+    if (localCfg != null && localCfg.hasAnyData) {
+      return localCfg;
+    }
+
+    if ((lesson.serverMeetingUrl ?? '').trim().isNotEmpty) {
+      return ZoomAccessConfig(
+        mode: 'link',
+        url: lesson.serverMeetingUrl!.trim(),
+      );
+    }
+    if ((lesson.serverMeetingCode ?? '').trim().isNotEmpty ||
+        (lesson.serverMeetingPassword ?? '').trim().isNotEmpty) {
+      return ZoomAccessConfig(
+        mode: 'credentials',
+        meetingCode: lesson.serverMeetingCode?.trim(),
+        password: lesson.serverMeetingPassword?.trim(),
+      );
+    }
+
+    return null;
+  }
+
+  Future<void> _saveZoomConfig(LessonModel lesson, ZoomAccessConfig? cfg) async {
+    final key = buildMeetingKey(subject: lesson.subject, teacher: lesson.teacher);
+    setState(() {
+      if (cfg == null || !cfg.hasAnyData) {
+        _zoomConfigs.remove(key);
+      } else {
+        _zoomConfigs[key] = cfg;
+      }
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+    final encoded = _zoomConfigs.map((k, v) => MapEntry(k, v.toJson()));
+    await prefs.setString(kMeetingsPrefsKey, jsonEncode(encoded));
+  }
+
+  Future<void> _saveNote(LessonModel lesson, String? note) async {
+    final key = buildNoteKey(lesson);
+    final cleaned = (note ?? '').trim();
+
+    setState(() {
+      if (cleaned.isEmpty) {
+        _lessonNotes.remove(key);
+      } else {
+        _lessonNotes[key] = cleaned;
+      }
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kNotesPrefsKey, jsonEncode(_lessonNotes));
+  }
+
+  Future<void> _fetchGroups(SharedPreferences prefs) async {
+    try {
+      final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/groups');
+      final resp = await http.get(uri).timeout(const Duration(seconds: 8));
+      if (resp.statusCode != 200) return;
+
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final list = (data['groups'] as List<dynamic>).map((e) => e.toString()).toList();
+
+      if (list.isNotEmpty && mounted) {
+        setState(() {
+          _groups = list;
+          if (!_groups.contains(_selectedGroup)) {
+            _groups.insert(0, _selectedGroup);
+          }
+        });
+        await prefs.setString(kGroupsCachePrefsKey, jsonEncode(list));
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _fetchSchedule(
+    SharedPreferences? prefs, {
+    bool showSpinnerIfEmpty = true,
+  }) async {
+    final sp = prefs ?? await SharedPreferences.getInstance();
+    final cached = _readCachedLessons(sp, _selectedGroup);
+
+    if (showSpinnerIfEmpty && cached.isEmpty) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
+
+    try {
+      final uri = Uri.parse(
+        '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(_selectedGroup)}',
+      );
+      final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
+
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final items = (data['items'] as List<dynamic>)
+          .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
+          .toList();
+
+      await sp.setString(
+        _scheduleCacheKey(_selectedGroup),
+        jsonEncode(items.map((e) => e.toJson()).toList()),
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _lessons = items;
+        _selectedDate =
+            _selectedDate != null && _uniqueDates(items).contains(_selectedDate)
+                ? _selectedDate
+                : _pickInitialDate(items);
+        _loading = false;
+        _offlineBanner = false;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      if (cached.isNotEmpty) {
+        setState(() {
+          _lessons = cached;
+          _selectedDate ??= _pickInitialDate(cached);
+          _loading = false;
+          _offlineBanner = true;
+          _error = null;
+        });
+      } else {
+        setState(() {
+          _loading = false;
+          _offlineBanner = true;
+          _error = 'Немає зв’язку і кешу для групи $_selectedGroup: $e';
+        });
+      }
+    }
+  }
+
+  Future<void> _onGroupChanged(String? newGroup) async {
+    if (newGroup == null || newGroup == _selectedGroup) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kSelectedGroupPrefsKey, newGroup);
+
+    final cached = _readCachedLessons(prefs, newGroup);
+    setState(() {
+      _selectedGroup = newGroup;
+      _lessons = cached;
+      _selectedDate = _pickInitialDate(cached);
+      _error = null;
+      _loading = cached.isEmpty;
+    });
+
+    await _fetchSchedule(prefs, showSpinnerIfEmpty: cached.isEmpty);
+  }
+
+  Future<void> _openExternalUrl(String url) async {
+    final normalized = url.startsWith('http://') || url.startsWith('https://')
+        ? url
+        : 'https://$url';
+    final uri = Uri.parse(normalized);
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не вдалося відкрити: $normalized')),
+      );
+    }
+  }
+
+  Future<void> _launchZoom(ZoomAccessConfig cfg) async {
+    if (cfg.mode == 'link' && (cfg.url ?? '').trim().isNotEmpty) {
+      await _openExternalUrl(cfg.url!.trim());
+      return;
+    }
+    final cleanCode = (cfg.meetingCode ?? '').replaceAll(RegExp(r'\s+'), '');
+    if (cleanCode.isNotEmpty) {
+      final pwd = (cfg.password ?? '').trim();
+      final query = pwd.isNotEmpty ? '?pwd=${Uri.encodeComponent(pwd)}' : '';
+      await _openExternalUrl('https://zoom.us/j/$cleanCode$query');
+      return;
+    }
+    await _openExternalUrl(kZoomAppUrl);
+  }
+
+  Future<void> _copyText(String label, String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('$label скопійовано: $value')),
+    );
+  }
+
+  Future<void> _showZoomDialog(LessonModel lesson) async {
+    final current = _getZoomConfig(lesson);
+    final hasManualOverride = _zoomConfigs.containsKey(
+      buildMeetingKey(subject: lesson.subject, teacher: lesson.teacher),
+    );
+
+    String mode = current?.mode ?? 'link';
+    final urlController = TextEditingController(text: current?.url ?? '');
+    final codeController = TextEditingController(text: current?.meetingCode ?? '');
+    final passController = TextEditingController(text: current?.password ?? '');
+
+    final result = await showDialog<ZoomAccessConfig?>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('Налаштування Zoom'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  lesson.subject,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                if (lesson.teacher != null) ...[
+                  const SizedBox(height: 2),
+                  Text(lesson.teacher!, style: Theme.of(ctx).textTheme.bodySmall),
+                ],
+                if (!hasManualOverride && current != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'Підставлено автоматично з розкладу — можна відредагувати',
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(ctx).colorScheme.primary,
+                        ),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                      value: 'link',
+                      label: Text('Посилання'),
+                      icon: Icon(Icons.link, size: 18),
+                    ),
+                    ButtonSegment(
+                      value: 'credentials',
+                      label: Text('Код і пароль'),
+                      icon: Icon(Icons.key, size: 18),
+                    ),
+                  ],
+                  selected: {mode},
+                  onSelectionChanged: (sel) {
+                    setDialogState(() => mode = sel.first);
+                  },
+                ),
+                const SizedBox(height: 12),
+                if (mode == 'link')
+                  TextField(
+                    controller: urlController,
+                    keyboardType: TextInputType.url,
+                    decoration: const InputDecoration(
+                      labelText: 'Посилання на Zoom',
+                      hintText: 'https://zoom.us/j/...',
+                      border: OutlineInputBorder(),
+                    ),
+                  )
+                else ...[
+                  TextField(
+                    controller: codeController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Код конференції (ID)',
+                      hintText: '123 456 7890',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: passController,
+                    decoration: const InputDecoration(
+                      labelText: 'Пароль конференції',
+                      hintText: 'Наприклад: 123456',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: () => _openExternalUrl(kMoodleUrl),
+                  icon: const Icon(Icons.open_in_new, size: 18),
+                  label: const Text('Відкрити Moodle (do.kart.edu.ua)'),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            if (hasManualOverride)
+              TextButton(
+                onPressed: () => Navigator.pop(
+                  ctx,
+                  const ZoomAccessConfig(mode: 'link', url: ''),
+                ),
+                child: const Text('Скинути ручні зміни'),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, null),
+              child: const Text('Скасувати'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(
+                  ctx,
+                  ZoomAccessConfig(
+                    mode: mode,
+                    url: urlController.text.trim(),
+                    meetingCode: codeController.text.trim(),
+                    password: passController.text.trim(),
+                  ),
+                );
+              },
+              child: const Text('Зберегти'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (result != null) {
+      await _saveZoomConfig(lesson, result);
+    }
+  }
+
+  Future<void> _showNoteDialog(LessonModel lesson) async {
+    final existing = _lessonNotes[buildNoteKey(lesson)] ?? '';
+    final controller = TextEditingController(text: existing);
+
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Нотатка до пари'),
+        content: TextField(
+          controller: controller,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            hintText: 'Контрольна, завдання в Moodle, курсова...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('Скасувати'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('Зберегти'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) await _saveNote(lesson, result);
+  }
+
+  DateTime _parseTodayTime(String hhmm) {
+    final now = DateTime.now();
+    final parts = hhmm.split(':');
+    return DateTime(
+      now.year,
+      now.month,
+      now.day,
+      int.parse(parts[0]),
+      int.parse(parts[1]),
+    );
+  }
+
+  double _lessonProgress(LessonModel lesson) {
+    final now = DateTime.now();
+    final start = _parseTodayTime(lesson.timeStart);
+    final end = _parseTodayTime(lesson.timeEnd);
+    final total = end.difference(start).inSeconds;
+    if (total <= 0) return 0;
+    final elapsed = now.difference(start).inSeconds;
+    return (elapsed / total).clamp(0.0, 1.0);
+  }
+
+  String _liveStatusText(LessonModel lesson) {
+    final now = DateTime.now();
+    final start = _parseTodayTime(lesson.timeStart);
+    final end = _parseTodayTime(lesson.timeEnd);
+
+    if (now.isAfter(start) && now.isBefore(end)) {
+      final minsLeft = end.difference(now).inMinutes + 1;
+      return 'Йде зараз • до кінця $minsLeft хв';
+    }
+    if (now.isBefore(start)) {
+      final minsToStart = start.difference(now).inMinutes + 1;
+      return 'Початок через $minsToStart хв';
+    }
+    return 'Завершено';
+  }
+
+  LessonModel? _findActiveOrNextLesson(List<LessonModel> allLessons) {
+    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+    final todayItems = allLessons.where((l) => l.date == todayStr).toList();
+    if (todayItems.isEmpty) return null;
+
+    final now = DateTime.now();
+    for (final l in todayItems) {
+      final start = _parseTodayTime(l.timeStart);
+      final end = _parseTodayTime(l.timeEnd);
+      if (now.isAfter(start) && now.isBefore(end)) return l;
+    }
+    for (final l in todayItems) {
+      if (now.isBefore(_parseTodayTime(l.timeStart))) return l;
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dates = _uniqueDates(_lessons);
+    final visibleLessons = _showAllDates || _selectedDate == null
+        ? _lessons
+        : _lessons.where((l) => l.date == _selectedDate).toList();
+    final featuredLesson = _findActiveOrNextLesson(_lessons);
+    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+
+    return Scaffold(
+      appBar: AppBar(
+        title: DropdownButtonHideUnderline(
+          child: DropdownButton<String>(
+            value: _selectedGroup,
+            items: _groups
+                .map((g) => DropdownMenuItem<String>(value: g, child: Text(g)))
+                .toList(),
+            onChanged: _onGroupChanged,
+          ),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Відкрити Moodle',
+            onPressed: () => _openExternalUrl(kMoodleUrl),
+            icon: const Icon(Icons.school_outlined),
+          ),
+          IconButton(
+            tooltip: 'Оновити розклад',
+            onPressed: () => _fetchSchedule(null),
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (_offlineBanner)
+            Container(
+              width: double.infinity,
+              color: Theme.of(context).colorScheme.secondaryContainer,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: const Text(
+                'Офлайн-режим: показано збережений розклад',
+                style: TextStyle(fontSize: 12),
+              ),
+            ),
+          if (featuredLesson != null)
+            Card(
+              margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+              color: Theme.of(context).colorScheme.primaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _liveStatusText(featuredLesson).toUpperCase(),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '\${featuredLesson.lessonNumber} пара (\${featuredLesson.timeStart}–\${featuredLesson.timeEnd}) • \${featuredLesson.subject}',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(value: _lessonProgress(featuredLesson)),
+                    if (_getZoomConfig(featuredLesson) != null) ...[
+                      const SizedBox(height: 8),
+                      FilledButton.icon(
+                        onPressed: () => _launchZoom(_getZoomConfig(featuredLesson)!),
+                        icon: const Icon(Icons.videocam, size: 18),
+                        label: const Text('Увійти в Zoom'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          if (dates.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: Row(
+                children: [
+                  ActionChip(
+                    label: const Text('Сьогодні'),
+                    onPressed: dates.contains(todayStr)
+                        ? () => setState(() {
+                              _showAllDates = false;
+                              _selectedDate = todayStr;
+                            })
+                        : null,
+                  ),
+                  const SizedBox(width: 8),
+                  FilterChip(
+                    label: const Text('Усі дні'),
+                    selected: _showAllDates,
+                    onSelected: (val) => setState(() => _showAllDates = val),
+                  ),
+                ],
+              ),
+            ),
+            if (!_showAllDates)
+              SizedBox(
+                height: 48,
+                child: ListView.separated(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: dates.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  itemBuilder: (context, idx) {
+                    final d = dates[idx];
+                    final selected = d == _selectedDate;
+                    return ChoiceChip(
+                      label: Text(d),
+                      selected: selected,
+                      onSelected: (_) => setState(() => _selectedDate = d),
+                    );
+                  },
+                ),
+              ),
+          ],
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _error != null
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(_error!, textAlign: TextAlign.center),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: visibleLessons.length,
+                        itemBuilder: (context, index) {
+                          final item = visibleLessons[index];
+                          final zoomCfg = _getZoomConfig(item);
+                          final note = _lessonNotes[buildNoteKey(item)];
+                          final metaParts = <String>[
+                            '\${item.lessonNumber} пара (\${item.timeStart}–\${item.timeEnd})',
+                            'Онлайн',
+                            if (item.lessonType != null) item.lessonType!,
+                            if (item.teacher != null) item.teacher!,
+                          ];
+
+                          return Card(
+                            margin: const EdgeInsets.only(bottom: 10),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    item.subject,
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text('\${item.date} • \${metaParts.join(' • ')}'),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _liveStatusText(item),
+                                    style: Theme.of(context).textTheme.bodySmall,
+                                  ),
+                                  if (zoomCfg != null &&
+                                      zoomCfg.mode == 'credentials') ...[
+                                    const SizedBox(height: 8),
+                                    Wrap(
+                                      spacing: 8,
+                                      runSpacing: 6,
+                                      children: [
+                                        if ((zoomCfg.meetingCode ?? '').isNotEmpty)
+                                          ActionChip(
+                                            avatar: const Icon(Icons.copy, size: 16),
+                                            label: Text('Код: \${zoomCfg.meetingCode}'),
+                                            onPressed: () => _copyText(
+                                              'Код конференції',
+                                              zoomCfg.meetingCode!,
+                                            ),
+                                          ),
+                                        if ((zoomCfg.password ?? '').isNotEmpty)
+                                          ActionChip(
+                                            avatar: const Icon(Icons.copy, size: 16),
+                                            label: Text('Пароль: \${zoomCfg.password}'),
+                                            onPressed: () => _copyText(
+                                              'Пароль конференції',
+                                              zoomCfg.password!,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                  if (note != null && note.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Container(
+                                      width: double.infinity,
+                                      padding: const EdgeInsets.all(8),
+                                      decoration: BoxDecoration(
+                                        color: Theme.of(context)
+                                            .colorScheme
+                                            .surfaceContainerHighest,
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: Text('Нотатка: $note'),
+                                    ),
+                                  ],
+                                  const SizedBox(height: 10),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      if (zoomCfg != null)
+                                        FilledButton.icon(
+                                          onPressed: () => _launchZoom(zoomCfg),
+                                          icon: const Icon(Icons.videocam, size: 18),
+                                          label: const Text('Увійти в Zoom'),
+                                        ),
+                                      OutlinedButton.icon(
+                                        onPressed: () => _showZoomDialog(item),
+                                        icon: Icon(
+                                          zoomCfg == null
+                                              ? Icons.add_link
+                                              : Icons.edit,
+                                          size: 18,
+                                        ),
+                                        label: Text(
+                                          zoomCfg == null
+                                              ? 'Додати Zoom з Moodle'
+                                              : 'Змінити Zoom',
+                                        ),
+                                      ),
+                                      OutlinedButton.icon(
+                                        onPressed: () => _showNoteDialog(item),
+                                        icon: const Icon(
+                                          Icons.note_add_outlined,
+                                          size: 18,
+                                        ),
+                                        label: Text(
+                                          note == null || note.isEmpty
+                                              ? 'Нотатка'
+                                              : 'Змінити нотатку',
+                                        ),
+                                      ),
+                                      if (zoomCfg == null)
+                                        TextButton.icon(
+                                          onPressed: () => _openExternalUrl(kMoodleUrl),
+                                          icon: const Icon(Icons.open_in_new, size: 18),
+                                          label: const Text('Moodle'),
+                                        ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+}
