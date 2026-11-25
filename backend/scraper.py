@@ -73,7 +73,7 @@ def _download_with_retry_text(url: str) -> str:
     raise last_exc
 
 
-def run_sync() -> dict:
+def run_sync(force: bool = False) -> dict:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     urls = fetch_schedule_links()
     updated_files = 0
@@ -91,7 +91,7 @@ def run_sync() -> dict:
                     raise ValueError("Empty file downloaded")
 
                 file_hash = sha256_bytes(content)
-                if get_file_hash(url) == file_hash:
+                if not force and get_file_hash(url) == file_hash:
                     continue
 
                 raw_name = Path(url.split("?", 1)[0]).name or "schedule.pdf"
