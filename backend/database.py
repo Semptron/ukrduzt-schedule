@@ -4,6 +4,9 @@ from parser import normalize_teacher_name
 
 DB_PATH = Path("data/schedule.db")
 
+_UA_ALPHABET = "абвгґдеєжзиіїйклмнопрстуфхцчшщьюя"
+_UA_ORDER = {ch: idx for idx, ch in enumerate(_UA_ALPHABET)}
+
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -18,6 +21,36 @@ def _normalize_search_key(value: str | None) -> str:
     if not value:
         return ""
     return " ".join(value.lower().split()).replace(" ", "")
+
+
+def _normalize_date_str(value: str | None) -> str | None:
+    if not value:
+        return None
+    parts = value.strip().split(".")
+    if len(parts) != 3:
+        return value.strip()
+    try:
+        day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+        return f"{day:02d}.{month:02d}.{year:04d}"
+    except ValueError:
+        return value.strip()
+
+
+def _date_sort_key(date_str: str | None) -> tuple[int, int, int, str]:
+    if not date_str:
+        return (9999, 12, 31, "")
+    parts = date_str.strip().split(".")
+    if len(parts) == 3:
+        try:
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            return (year, month, day, date_str)
+        except ValueError:
+            pass
+    return (9999, 12, 31, date_str)
+
+
+def _ua_sort_key(text: str) -> tuple:
+    return tuple((_UA_ORDER.get(ch, 100 + ord(ch)), ch) for ch in text.lower())
 
 
 def init_db() -> None:
@@ -125,7 +158,7 @@ def replace_source_lessons(
             [
                 (
                     source_url,
-                    item["date"].strip(),
+                    _normalize_date_str(item["date"]) or item["date"].strip(),
                     item["group"].strip(),
                     int(item["lesson_number"]),
                     item["time_start"],
@@ -171,10 +204,10 @@ def list_groups() -> list[str]:
             SELECT DISTINCT TRIM(group_name) AS group_name
             FROM lessons
             WHERE TRIM(group_name) != ''
-            ORDER BY group_name
             """
         ).fetchall()
-        return [r["group_name"] for r in rows]
+        groups = [r["group_name"] for r in rows]
+        return sorted(groups, key=_ua_sort_key)
 
 
 def list_teachers() -> list[str]:
@@ -184,7 +217,6 @@ def list_teachers() -> list[str]:
             SELECT DISTINCT TRIM(teacher) AS teacher
             FROM lessons
             WHERE teacher IS NOT NULL AND TRIM(teacher) != ''
-            ORDER BY teacher
             """
         ).fetchall()
         cleaned = {
@@ -192,7 +224,7 @@ def list_teachers() -> list[str]:
             for r in rows
             if (norm := normalize_teacher_name(r["teacher"])) is not None
         }
-        return sorted(cleaned)
+        return sorted(cleaned, key=_ua_sort_key)
 
 
 def query_lessons(
@@ -206,25 +238,27 @@ def query_lessons(
     if group:
         clauses.append("LOWER(TRIM(group_name)) = LOWER(TRIM(?))")
         params.append(group)
-    if date:
-        clauses.append("TRIM(date) = TRIM(?)")
-        params.append(date)
+
+    norm_date = _normalize_date_str(date)
+    if norm_date:
+        clauses.append("TRIM(date) = ?")
+        params.append(norm_date)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
-        SELECT date, group_name, lesson_number, time_start,
+        SELECT id, date, group_name, lesson_number, time_start,
                time_end, subject, lesson_type, teacher,
                meeting_url, meeting_code, meeting_password
         FROM lessons
         {where_sql}
-        ORDER BY date ASC, lesson_number ASC, id ASC
+        ORDER BY id ASC
     """
 
     teacher_key = _normalize_search_key(teacher)
 
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
-        result: list[dict] = []
+        matched_rows: list[sqlite3.Row] = []
         for r in rows:
             row_teacher = r["teacher"]
             if teacher_key:
@@ -232,22 +266,32 @@ def query_lessons(
                     continue
                 if teacher_key not in _normalize_search_key(row_teacher):
                     continue
-            result.append(
-                {
-                    "date": r["date"],
-                    "group": r["group_name"],
-                    "lesson_number": r["lesson_number"],
-                    "time_start": r["time_start"],
-                    "time_end": r["time_end"],
-                    "subject": r["subject"],
-                    "lesson_type": r["lesson_type"],
-                    "teacher": row_teacher,
-                    "meeting_url": r["meeting_url"],
-                    "meeting_code": r["meeting_code"],
-                    "meeting_password": r["meeting_password"],
-                }
+            matched_rows.append(r)
+
+        matched_rows.sort(
+            key=lambda r: (
+                _date_sort_key(r["date"]),
+                int(r["lesson_number"]),
+                int(r["id"]),
             )
-        return result
+        )
+
+        return [
+            {
+                "date": r["date"],
+                "group": r["group_name"],
+                "lesson_number": r["lesson_number"],
+                "time_start": r["time_start"],
+                "time_end": r["time_end"],
+                "subject": r["subject"],
+                "lesson_type": r["lesson_type"],
+                "teacher": r["teacher"],
+                "meeting_url": r["meeting_url"],
+                "meeting_code": r["meeting_code"],
+                "meeting_password": r["meeting_password"],
+            }
+            for r in matched_rows
+        ]
 
 
 def get_recent_changes(limit: int = 20) -> list[dict]:
