@@ -26,7 +26,7 @@ _last_sync_stats: dict[str, Any] | None = None
 _last_sync_error: str | None = None
 
 
-def _execute_sync_safe() -> dict[str, Any] | None:
+def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
     global _sync_in_progress, _last_sync_stats, _last_sync_error
 
     if not _sync_lock.acquire(blocking=False):
@@ -34,7 +34,7 @@ def _execute_sync_safe() -> dict[str, Any] | None:
 
     _sync_in_progress = True
     try:
-        stats = run_sync()
+        stats = run_sync(force=force)
         _last_sync_stats = stats
         _last_sync_error = None
         logger.info("Schedule sync finished: %s", stats)
@@ -51,7 +51,7 @@ def _execute_sync_safe() -> dict[str, Any] | None:
 async def background_sync_loop() -> None:
     while True:
         try:
-            await asyncio.to_thread(_execute_sync_safe)
+            await asyncio.to_thread(_execute_sync_safe, False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -126,23 +126,25 @@ def get_schedule(
 
 
 @app.post("/api/v1/sync")
-def trigger_sync():
+def trigger_sync(force: bool = Query(False, description="Примусово перепарсити всі файли")):
     if _sync_in_progress:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
                 "status": "already_running",
+                "force": force,
                 "last_stats": _last_sync_stats,
                 "last_error": _last_sync_error,
             },
         )
 
-    thread = threading.Thread(target=_execute_sync_safe, daemon=True)
+    thread = threading.Thread(target=_execute_sync_safe, args=(force,), daemon=True)
     thread.start()
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
             "status": "started",
+            "force": force,
             "last_stats": _last_sync_stats,
             "last_error": _last_sync_error,
         },
