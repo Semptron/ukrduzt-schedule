@@ -285,4 +285,12 @@ def parse_cell_to_lesson(
         else (any_url_match.group(0) if any_url_match else None)
     )
 
-    parts = [p.
+    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+    subject = parts[0] if parts else cleaned
+    teacher = _extract_teacher_from_parts(parts, cleaned)
+
+    if not lesson_type or (not room and not meeting_url):
+        warnings.append(
+            ParseWarning(
+                date=date_str,
+                
