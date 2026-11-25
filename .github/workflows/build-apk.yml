@@ -28,7 +28,7 @@ jobs:
         run: |
           flutter create --org ua.edu.kart.schedule ukrduzt_app
           rm -f ukrduzt_app/test/widget_test.dart
-          cp -r flutter/* ukrduzt_app/lib/
+          cp flutter/*.dart ukrduzt_app/lib/
 
       - name: Configure pubspec.yaml
         run: |
@@ -37,23 +37,25 @@ jobs:
           p = Path("ukrduzt_app/pubspec.yaml")
           text = p.read_text(encoding="utf-8")
           target = "  cupertino_icons: ^1.0.8\n"
-          deps = "  http: ^1.2.0\n  shared_preferences: ^2.2.0\n  url_launcher: ^6.2.0\n"
-          if target in text:
-              text = text.replace(target, target + deps, 1)
-          else:
-              text = text.replace("dependencies:\n", "dependencies:\n" + deps, 1)
+          deps = "  http: ^1.2.2\n  shared_preferences: ^2.3.3\n  url_launcher: ^6.3.1\n"
+          if "http:" not in text:
+              if target in text:
+                  text = text.replace(target, target + deps, 1)
+              else:
+                  text = text.replace("dependencies:\n", "dependencies:\n" + deps, 1)
           p.write_text(text, encoding="utf-8")
           '
 
       - name: Ensure INTERNET permission in AndroidManifest.xml
         run: |
           python3 -c '
+          import re
           from pathlib import Path
           p = Path("ukrduzt_app/android/app/src/main/AndroidManifest.xml")
           text = p.read_text(encoding="utf-8")
-          perm = "<uses-permission android:name=\"android.permission.INTERNET\" />\n"
-          if perm not in text:
-              text = text.replace("<application", perm + "    <application", 1)
+          if "android.permission.INTERNET" not in text:
+              perm = "    <uses-permission android:name=\"android.permission.INTERNET\" />\n"
+              text = re.sub(r"(<application\b)", perm + r"\1", text, count=1)
           p.write_text(text, encoding="utf-8")
           '
 
