@@ -1,6 +1,6 @@
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import re
-from dataclasses import asdict, dataclass
 import pdfplumber
 
 GROUP_RE = re.compile(
@@ -32,6 +32,27 @@ ZOOM_PASS_RE = re.compile(
     re.IGNORECASE,
 )
 SUBJECT_QUOTES_RE = re.compile(r"[«\"]([^»\"]+)[»\"]")
+
+TEACHER_NOISE_RE = re.compile(
+    r"(?:,?\s*\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лекц\w*|практ\w*|лаб\w*)\b\.?)+$",
+    re.IGNORECASE,
+)
+TEACHER_EXACT_NOISE = {
+    "4",
+    "і",
+    "м",
+    "екз.",
+    "екз",
+    "інд. конс.",
+    "інд. конс",
+    "інд конс",
+    "інд. консульт.",
+    "індив. консульт.",
+    "індивід. консультація",
+}
+SURNAME_INITIALS_RE = re.compile(
+    r"^[А-ЯІЇЄҐA-Z][а-яіїєґa-z'’`-]+\s+[А-ЯІЇЄҐA-Z]\.\s*[А-ЯІЇЄҐA-Z]\.?$"
+)
 
 MONTHS_UA = {
     "січня": "01",
@@ -96,6 +117,42 @@ def clean_cell(text: str | None) -> str:
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line and line != "|"]
     return " ".join(lines).strip()
+
+
+def normalize_teacher_name(raw_teacher: str | None) -> str | None:
+    if not raw_teacher:
+        return None
+
+    cleaned = re.sub(r"\s+", " ", raw_teacher).strip(" ,;|")
+    if not cleaned:
+        return None
+
+    cleaned = TEACHER_NOISE_RE.sub("", cleaned).strip(" ,;|")
+    if not cleaned:
+        return None
+
+    cleaned = re.sub(
+        r"\b([А-ЯІЇЄҐA-Z])\.([А-ЯІЇЄҐA-Z])(?=\.|\s|$)",
+        r"\1. \2.",
+        cleaned,
+    )
+    cleaned = re.sub(r"\.\.+", ".", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;|")
+
+    if cleaned.lower() in TEACHER_EXACT_NOISE:
+        return None
+
+    if len(cleaned) < 5 or cleaned.isdigit():
+        return None
+
+    if SURNAME_INITIALS_RE.match(cleaned):
+        return cleaned
+
+    words = cleaned.split()
+    if len(words) >= 2 and all(re.match(r"^[А-ЯІЇЄҐA-Z]", w) for w in words[:2]):
+        return cleaned
+
+    return None
 
 
 def detect_lesson_number(row: list[str | None], fallback_counter: int) -> int:
@@ -184,7 +241,8 @@ def parse_cell_to_lesson(
 
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
     subject = parts[0] if parts else cleaned
-    teacher = parts[-1] if len(parts) >= 3 else None
+    raw_teacher = parts[-1] if len(parts) >= 3 else None
+    teacher = normalize_teacher_name(raw_teacher)
 
     if not lesson_type or (not room and not meeting_url):
         warnings.append(
@@ -302,7 +360,7 @@ def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
                 k in next_line.lower()
                 for k in ("ідентифікатор", "код доступу", "курс", "пара")
             ):
-                current_teacher = next_line
+                current_teacher = normalize_teacher_name(next_line)
 
         dates = _extract_dates_from_text(line, fallback_year=fallback_year)
         if dates:
