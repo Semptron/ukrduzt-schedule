@@ -14,6 +14,12 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _normalize_search_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.lower().split()).replace(" ", "")
+
+
 def init_db() -> None:
     with get_connection() as conn:
         conn.execute(
@@ -200,9 +206,6 @@ def query_lessons(
     if group:
         clauses.append("LOWER(TRIM(group_name)) = LOWER(TRIM(?))")
         params.append(group)
-    if teacher:
-        clauses.append("LOWER(TRIM(teacher)) LIKE ?")
-        params.append(f"%{teacher.strip().lower()}%")
     if date:
         clauses.append("TRIM(date) = TRIM(?)")
         params.append(date)
@@ -217,24 +220,34 @@ def query_lessons(
         ORDER BY date ASC, lesson_number ASC, id ASC
     """
 
+    teacher_key = _normalize_search_key(teacher)
+
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
-        return [
-            {
-                "date": r["date"],
-                "group": r["group_name"],
-                "lesson_number": r["lesson_number"],
-                "time_start": r["time_start"],
-                "time_end": r["time_end"],
-                "subject": r["subject"],
-                "lesson_type": r["lesson_type"],
-                "teacher": r["teacher"],
-                "meeting_url": r["meeting_url"],
-                "meeting_code": r["meeting_code"],
-                "meeting_password": r["meeting_password"],
-            }
-            for r in rows
-        ]
+        result: list[dict] = []
+        for r in rows:
+            row_teacher = r["teacher"]
+            if teacher_key:
+                if not row_teacher:
+                    continue
+                if teacher_key not in _normalize_search_key(row_teacher):
+                    continue
+            result.append(
+                {
+                    "date": r["date"],
+                    "group": r["group_name"],
+                    "lesson_number": r["lesson_number"],
+                    "time_start": r["time_start"],
+                    "time_end": r["time_end"],
+                    "subject": r["subject"],
+                    "lesson_type": r["lesson_type"],
+                    "teacher": row_teacher,
+                    "meeting_url": r["meeting_url"],
+                    "meeting_code": r["meeting_code"],
+                    "meeting_password": r["meeting_password"],
+                }
+            )
+        return result
 
 
 def get_recent_changes(limit: int = 20) -> list[dict]:
