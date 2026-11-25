@@ -293,4 +293,327 @@ def parse_cell_to_lesson(
         warnings.append(
             ParseWarning(
                 date=date_str,
-                
+                lesson_number=lesson_number,
+                group=group,
+                reason="missing_type_or_location",
+                raw=cleaned,
+            )
+        )
+
+    time_start, time_end = BELLS.get(lesson_number, ("00:00", "00:00"))
+
+    return LessonItem(
+        date=date_str,
+        group=group,
+        lesson_number=lesson_number,
+        time_start=time_start,
+        time_end=time_end,
+        subject=subject,
+        room=room,
+        lesson_type=lesson_type,
+        teacher=teacher,
+        meeting_url=meeting_url,
+        meeting_code=None,
+        meeting_password=None,
+        raw=cleaned,
+    )
+
+
+def _column_ranges_from_words(
+    page, table_bbox, group_names_by_col: dict[int, str], num_cols: int
+) -> dict[int, tuple[float, float]]:
+    x0_t, _, x1_t, _ = table_bbox
+    col_width = (x1_t - x0_t) / max(num_cols, 1)
+    bounds: dict[int, tuple[float, float]] = {}
+
+    for col_idx in range(num_cols):
+        c_x0 = x0_t + col_idx * col_width
+        c_x1 = c_x0 + col_width
+        bounds[col_idx] = (c_x0, c_x1)
+
+    words = page.within_bbox(table_bbox).extract_words()
+    for col_idx, g_name in group_names_by_col.items():
+        matching = [w for w in words if g_name in w["text"]]
+        if matching:
+            left = min(w["x0"] for w in matching) - 6
+            right = max(w["x1"] for w in matching) + 6
+            bounds[col_idx] = (max(x0_t, left), min(x1_t, right))
+    return bounds
+
+
+def _extract_tables_from_page(page) -> list:
+    tables = page.find_tables()
+    if tables:
+        return tables
+    return page.find_tables(
+        table_settings={
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 4,
+            "join_tolerance": 4,
+        }
+    )
+
+
+def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
+    pages_lines: list[tuple[list[str], list[str]]] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            lines = [
+                re.sub(r"\s+", " ", line).strip()
+                for line in txt.splitlines()
+                if re.sub(r"\s+", " ", line).strip()
+            ]
+            p_groups = _extract_groups_from_text("\n".join(lines))
+            if lines:
+                pages_lines.append((lines, p_groups))
+
+    if not pages_lines:
+        return []
+
+    joined = "\n".join(line for lines, _ in pages_lines for line in lines)
+    subj_match = SUBJECT_QUOTES_RE.search(joined)
+    default_subject = subj_match.group(1).strip() if subj_match else "Заняття"
+    default_type = (
+        "консультація"
+        if ("консультатив" in joined.lower() or "конс" in joined.lower())
+        else "заняття"
+    )
+
+    zoom_id_match = ZOOM_ID_RE.search(joined)
+    zoom_pass_match = ZOOM_PASS_RE.search(joined)
+    meeting_code = (
+        re.sub(r"\s+", " ", zoom_id_match.group(1)).strip()
+        if zoom_id_match
+        else None
+    )
+    meeting_password = zoom_pass_match.group(1).strip() if zoom_pass_match else None
+
+    year_match = re.search(r"\b(202[4-9]|203\d)\b", joined)
+    fallback_year = year_match.group(1) if year_match else str(datetime.now().year)
+
+    current_teacher: str | None = None
+    current_date: str | None = None
+    lesson_counter = 0
+    items: list[LessonItem] = []
+    warnings: list[ParseWarning] = []
+
+    for full_lines, page_groups in pages_lines:
+        active_page_groups = page_groups or ["Загальний потік"]
+
+        for i, line in enumerate(full_lines):
+            if "проводить" in line.lower() and i + 1 < len(full_lines):
+                next_line = full_lines[i + 1]
+                if not any(
+                    k in next_line.lower()
+                    for k in ("ідентифікатор", "код доступу", "курс", "пара")
+                ):
+                    current_teacher = normalize_teacher_name(next_line)
+
+            dates = _extract_dates_from_text(line, fallback_year=fallback_year)
+            if dates:
+                current_date = dates[0]
+                lesson_counter = 0
+                if DATE_RE.fullmatch(line) or SHORT_DATE_RE.fullmatch(line):
+                    continue
+
+            line_groups = _extract_groups_from_text(line)
+            target_groups = line_groups if line_groups else active_page_groups
+
+            pair_match = PAIR_RE.search(line)
+            if dates and pair_match:
+                pair_nums: list[int] = []
+                for grp_idx in (1, 2, 3):
+                    val = pair_match.group(grp_idx)
+                    if val and val.isdigit():
+                        p = int(val)
+                        if p not in pair_nums:
+                            pair_nums.append(p)
+
+                for d_str in dates:
+                    for p_num in pair_nums:
+                        start, end = BELLS.get(p_num, ("00:00", "00:00"))
+                        for g_name in target_groups:
+                            items.append(
+                                LessonItem(
+                                    date=d_str,
+                                    group=g_name,
+                                    lesson_number=p_num,
+                                    time_start=start,
+                                    time_end=end,
+                                    subject=default_subject,
+                                    room=None,
+                                    lesson_type=default_type,
+                                    teacher=current_teacher,
+                                    meeting_url=None,
+                                    meeting_code=meeting_code,
+                                    meeting_password=meeting_password,
+                                    raw=line,
+                                )
+                            )
+            elif current_date and LESSON_NUM_RE.match(line) and i + 1 < len(full_lines):
+                p_num = int(line)
+                next_line = full_lines[i + 1]
+                if not _extract_dates_from_text(next_line, fallback_year=fallback_year):
+                    for g_name in target_groups:
+                        parsed = parse_cell_to_lesson(
+                            current_date, g_name, p_num, next_line, warnings
+                        )
+                        if parsed:
+                            if not parsed.teacher and current_teacher:
+                                parsed.teacher = current_teacher
+                            parsed.meeting_code = meeting_code
+                            parsed.meeting_password = meeting_password
+                            items.append(parsed)
+            elif current_date and _looks_like_lesson_line(line):
+                lesson_counter += 1
+                p_num = min(lesson_counter, 8)
+                for g_name in target_groups:
+                    parsed = parse_cell_to_lesson(
+                        current_date, g_name, p_num, line, warnings
+                    )
+                    if parsed:
+                        if not parsed.teacher and current_teacher:
+                            parsed.teacher = current_teacher
+                        parsed.meeting_code = meeting_code
+                        parsed.meeting_password = meeting_password
+                        items.append(parsed)
+
+    return items
+
+
+def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
+    results: list[LessonItem] = []
+    warnings: list[ParseWarning] = []
+    current_date: str | None = None
+    fallback_year: str | None = None
+    lesson_counter = 0
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_txt = page.extract_text() or ""
+            if not fallback_year:
+                ym = re.search(r"\b(202[4-9]|203\d)\b", page_txt)
+                if ym:
+                    fallback_year = ym.group(1)
+
+            page_groups = _extract_groups_from_text(page_txt)
+            group_columns: dict[int, str] = {}
+
+            found_tables = _extract_tables_from_page(page)
+            for t_obj in found_tables:
+                table = t_obj.extract()
+                if not table:
+                    continue
+
+                num_cols = max((len(r) for r in table if r), default=0)
+                if num_cols == 0:
+                    continue
+
+                col_bounds = _column_ranges_from_words(
+                    page, t_obj.bbox, group_columns, num_cols
+                )
+
+                for row in table:
+                    if not row:
+                        continue
+
+                    detected_groups: dict[int, str] = {}
+                    for col_idx, cell in enumerate(row):
+                        txt = clean_cell(cell)
+                        groups_in_cell = _extract_groups_from_text(txt)
+                        if groups_in_cell:
+                            detected_groups[col_idx] = groups_in_cell[0]
+
+                    if detected_groups:
+                        group_columns.update(detected_groups)
+                        col_bounds = _column_ranges_from_words(
+                            page, t_obj.bbox, group_columns, num_cols
+                        )
+                        continue
+
+                    new_date = None
+                    for cell in row:
+                        txt = clean_cell(cell)
+                        dates_in_cell = _extract_dates_from_text(
+                            txt, fallback_year=fallback_year
+                        )
+                        if dates_in_cell:
+                            new_date = dates_in_cell[0]
+                            break
+
+                    if new_date:
+                        current_date = new_date
+                        lesson_counter = 0
+
+                    active_date = current_date or _format_default_date(fallback_year)
+                    non_empty_cells = [
+                        (idx, clean_cell(row[idx]))
+                        for idx in range(len(row))
+                        if clean_cell(row[idx])
+                    ]
+                    if not non_empty_cells:
+                        continue
+
+                    lesson_counter += 1
+                    lesson_num = detect_lesson_number(row, lesson_counter)
+
+                    if group_columns:
+                        for col_idx, group_name in group_columns.items():
+                            cell_txt = (
+                                clean_cell(row[col_idx]) if col_idx < len(row) else ""
+                            )
+                            if not cell_txt:
+                                g_x0, g_x1 = col_bounds.get(col_idx, (0.0, 0.0))
+                                g_center = (g_x0 + g_x1) / 2
+                                for other_idx, other_txt in non_empty_cells:
+                                    if other_idx in group_columns:
+                                        continue
+                                    o_x0, o_x1 = col_bounds.get(other_idx, (0.0, 0.0))
+                                    if o_x0 - 8 <= g_center <= o_x1 + 8:
+                                        cell_txt = other_txt
+                                        break
+
+                            item = parse_cell_to_lesson(
+                                active_date, group_name, lesson_num, cell_txt, warnings
+                            )
+                            if item:
+                                results.append(item)
+                    else:
+                        target_groups = page_groups or ["Загальний потік"]
+                        for _, cell_txt in non_empty_cells:
+                            if _extract_dates_from_text(
+                                cell_txt, fallback_year=fallback_year
+                            ):
+                                continue
+                            if LESSON_NUM_RE.match(cell_txt) or WEEKDAY_RE.match(
+                                cell_txt
+                            ):
+                                continue
+                            cell_groups = _extract_groups_from_text(cell_txt)
+                            groups_for_cell = cell_groups or target_groups
+                            for g_name in groups_for_cell:
+                                item = parse_cell_to_lesson(
+                                    active_date, g_name, lesson_num, cell_txt, warnings
+                                )
+                                if item:
+                                    results.append(item)
+
+    if not results:
+        results = _parse_text_fallback(pdf_path)
+
+    return {
+        "lessons": [asdict(r) for r in results],
+        "warnings": [asdict(w) for w in warnings],
+    }
+
+
+def _format_default_date(fallback_year: str | None) -> str:
+    now = datetime.now()
+    y = fallback_year or str(now.year)
+    return f"{now.day:02d}.{now.month:02d}.{y}"
+
+
+def parse_schedule_pdf(pdf_path: str) -> list[dict]:
+    return parse_schedule_pdf_detailed(pdf_path)["lessons"]
