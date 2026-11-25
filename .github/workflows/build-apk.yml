@@ -1,0 +1,73 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create Flutter project and copy app files
+        run: |
+          flutter create --org ua.edu.kart.schedule ukrduzt_app
+          cp -r flutter/* ukrduzt_app/lib/
+
+      - name: Configure pubspec.yaml
+        run: |
+          python3 -c '
+          from pathlib import Path
+          p = Path("ukrduzt_app/pubspec.yaml")
+          text = p.read_text(encoding="utf-8")
+          target = "  cupertino_icons: ^1.0.8\n"
+          deps = "  http: ^1.2.0\n  shared_preferences: ^2.2.0\n  url_launcher: ^6.2.0\n"
+          if target in text:
+              text = text.replace(target, target + deps, 1)
+          else:
+              text = text.replace("dependencies:\n", "dependencies:\n" + deps, 1)
+          p.write_text(text, encoding="utf-8")
+          '
+
+      - name: Ensure INTERNET permission in AndroidManifest.xml
+        run: |
+          python3 -c '
+          from pathlib import Path
+          p = Path("ukrduzt_app/android/app/src/main/AndroidManifest.xml")
+          text = p.read_text(encoding="utf-8")
+          perm = "<uses-permission android:name=\"android.permission.INTERNET\" />\n"
+          if perm not in text:
+              text = text.replace("<application", perm + "    <application", 1)
+          p.write_text(text, encoding="utf-8")
+          '
+
+      - name: Install packages and analyze
+        working-directory: ukrduzt_app
+        run: |
+          flutter pub get
+          flutter analyze
+
+      - name: Build release APK
+        working-directory: ukrduzt_app
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ukrduzt-schedule-apk
+          path: ukrduzt_app/build/app/outputs/flutter-apk/app-release.apk
