@@ -11,7 +11,7 @@ class UkrduztCorrespondenceApp extends StatelessWidget {
   const UkrduztCorrespondenceApp({super.key});
 
   // Замініть на адресу вашого задеплоєного бекенду (наприклад, https://your-app.onrender.com)
-  static const String _apiBaseUrl = 'http://10.0.2.2:8000';
+  static const String _apiBaseUrl = 'https://ukrduzt-schedule.onrender.com/';
 
   @override
   Widget build(BuildContext context) {
