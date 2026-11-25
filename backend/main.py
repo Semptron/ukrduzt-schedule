@@ -1,7 +1,10 @@
 import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from typing import Any
+from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from database import (
     get_recent_changes,
     init_db,
@@ -17,14 +20,42 @@ logger = logging.getLogger("ukrduzt-backend")
 
 SYNC_INTERVAL_SECONDS = 3600
 
+_sync_lock = threading.Lock()
+_sync_in_progress = False
+_last_sync_stats: dict[str, Any] | None = None
+_last_sync_error: str | None = None
+
+
+def _execute_sync_safe() -> dict[str, Any] | None:
+    global _sync_in_progress, _last_sync_stats, _last_sync_error
+
+    if not _sync_lock.acquire(blocking=False):
+        return None
+
+    _sync_in_progress = True
+    try:
+        stats = run_sync()
+        _last_sync_stats = stats
+        _last_sync_error = None
+        logger.info("Schedule sync finished: %s", stats)
+        return stats
+    except Exception as exc:
+        _last_sync_error = str(exc)
+        logger.warning("Schedule sync error: %s", exc)
+        return None
+    finally:
+        _sync_in_progress = False
+        _sync_lock.release()
+
 
 async def background_sync_loop() -> None:
     while True:
         try:
-            stats = await asyncio.to_thread(run_sync)
-            logger.info("Schedule sync finished: %s", stats)
+            await asyncio.to_thread(_execute_sync_safe)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.warning("Schedule sync error: %s", exc)
+            logger.warning("Background sync loop error: %s", exc)
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
@@ -36,6 +67,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="UkrDUZT Correspondence Schedule API", lifespan=lifespan)
@@ -72,11 +107,19 @@ def get_schedule(
     teacher: str | None = Query(None, description="Частина ПІБ викладача"),
     date: str | None = Query(None, description="Формат ДД.ММ.РРРР"),
 ):
-    if not any([group, teacher]):
+    clean_group = group.strip() if group else None
+    clean_teacher = teacher.strip() if teacher else None
+    clean_date = date.strip() if date else None
+
+    if not any([clean_group, clean_teacher]):
         raise HTTPException(
             status_code=400, detail="Вкажіть хоча б один параметр: group або teacher"
         )
-    items = query_lessons(group=group, teacher=teacher, date=date)
+    items = query_lessons(
+        group=clean_group,
+        teacher=clean_teacher,
+        date=clean_date,
+    )
     if not items:
         raise HTTPException(status_code=404, detail="Розклад не знайдено")
     return {"items": items}
@@ -84,7 +127,23 @@ def get_schedule(
 
 @app.post("/api/v1/sync")
 def trigger_sync():
-    try:
-        return run_sync()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    if _sync_in_progress:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "status": "already_running",
+                "last_stats": _last_sync_stats,
+                "last_error": _last_sync_error,
+            },
+        )
+
+    thread = threading.Thread(target=_execute_sync_safe, daemon=True)
+    thread.start()
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "status": "started",
+            "last_stats": _last_sync_stats,
+            "last_error": _last_sync_error,
+        },
+    )
