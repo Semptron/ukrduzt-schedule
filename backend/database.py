@@ -6,8 +6,10 @@ DB_PATH = Path("data/schedule.db")
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -116,12 +118,12 @@ def replace_source_lessons(
             [
                 (
                     source_url,
-                    item["date"],
-                    item["group"],
-                    item["lesson_number"],
+                    item["date"].strip(),
+                    item["group"].strip(),
+                    int(item["lesson_number"]),
                     item["time_start"],
                     item["time_end"],
-                    item["subject"],
+                    item["subject"].strip(),
                     item.get("room"),
                     item.get("lesson_type"),
                     item.get("teacher"),
@@ -158,7 +160,12 @@ def replace_source_lessons(
 def list_groups() -> list[str]:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT group_name FROM lessons ORDER BY group_name"
+            """
+            SELECT DISTINCT TRIM(group_name) AS group_name
+            FROM lessons
+            WHERE TRIM(group_name) != ''
+            ORDER BY group_name
+            """
         ).fetchall()
         return [r["group_name"] for r in rows]
 
@@ -167,7 +174,8 @@ def list_teachers() -> list[str]:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT DISTINCT teacher FROM lessons
+            SELECT DISTINCT TRIM(teacher) AS teacher
+            FROM lessons
             WHERE teacher IS NOT NULL AND TRIM(teacher) != ''
             ORDER BY teacher
             """
@@ -184,13 +192,13 @@ def query_lessons(
     params: list[object] = []
 
     if group:
-        clauses.append("group_name = ?")
+        clauses.append("LOWER(TRIM(group_name)) = LOWER(TRIM(?))")
         params.append(group)
     if teacher:
-        clauses.append("LOWER(teacher) LIKE ?")
+        clauses.append("LOWER(TRIM(teacher)) LIKE ?")
         params.append(f"%{teacher.strip().lower()}%")
     if date:
-        clauses.append("date = ?")
+        clauses.append("TRIM(date) = TRIM(?)")
         params.append(date)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
