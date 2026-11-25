@@ -105,7 +105,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
 
     try {
       final uri = Uri.parse(
-        '${widget.apiBaseUrl}/api/v1/schedule?teacher=\${Uri.encodeComponent(cleaned)}',
+        '${widget.apiBaseUrl}/api/v1/schedule?teacher=${Uri.encodeComponent(cleaned)}',
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 10));
       if (resp.statusCode == 404) {
@@ -117,7 +117,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
         return;
       }
       if (resp.statusCode != 200) {
-        throw Exception('HTTP \${resp.statusCode}');
+        throw Exception('HTTP ${resp.statusCode}');
       }
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
@@ -202,7 +202,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
     final code = (cfg.meetingCode ?? '').replaceAll(RegExp(r'\s+'), '');
     if (code.isNotEmpty) {
       final pwd = (cfg.password ?? '').trim();
-      final suffix = pwd.isNotEmpty ? '?pwd=\${Uri.encodeComponent(pwd)}' : '';
+      final suffix = pwd.isNotEmpty ? '?pwd=${Uri.encodeComponent(pwd)}' : '';
       await _openUrl('https://zoom.us/j/$code$suffix');
       return;
     }
@@ -235,165 +235,4 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-            child: TextField(
-              controller: _searchController,
-              onChanged: (_) => setState(() {}),
-              onSubmitted: _searchByTeacher,
-              decoration: InputDecoration(
-                labelText: 'ПІБ викладача',
-                hintText: 'Наприклад: Близнюк або Бабенко',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_searchController.text.isNotEmpty)
-                      IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          _searchController.clear();
-                          setState(() {
-                            _results = [];
-                            _error = null;
-                          });
-                        },
-                      ),
-                    IconButton(
-                      icon: const Icon(Icons.send),
-                      onPressed: () => _searchByTeacher(_searchController.text),
-                    ),
-                  ],
-                ),
-                border: const OutlineInputBorder(),
-              ),
-            ),
-          ),
-          if (_loadingTeachers)
-            const LinearProgressIndicator()
-          else if (filteredTeachers.isNotEmpty)
-            SizedBox(
-              height: 44,
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                scrollDirection: Axis.horizontal,
-                itemCount: filteredTeachers.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 8),
-                itemBuilder: (context, index) {
-                  final teacher = filteredTeachers[index];
-                  return ActionChip(
-                    label: Text(teacher),
-                    onPressed: () {
-                      _searchController.text = teacher;
-                      setState(() {});
-                      _searchByTeacher(teacher);
-                    },
-                  );
-                },
-              ),
-            ),
-          Expanded(
-            child: _searching
-                ? const Center(child: CircularProgressIndicator())
-                : _error != null
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Text(_error!, textAlign: TextAlign.center),
-                        ),
-                      )
-                    : _results.isEmpty
-                        ? const Center(
-                            child: Text('Введіть ПІБ викладача або оберіть зі списку'),
-                          )
-                        : ListView.builder(
-                            padding: const EdgeInsets.all(12),
-                            itemCount: _results.length,
-                            itemBuilder: (context, index) {
-                              final item = _results[index];
-                              final zoomCfg = _getZoomConfig(item);
-                              final meta = <String>[
-                                'Група \${item.group}',
-                                '\${item.lessonNumber} пара (\${item.timeStart}–\${item.timeEnd})',
-                                'Онлайн',
-                                if (item.lessonType != null) item.lessonType!,
-                                if (item.teacher != null) item.teacher!,
-                              ];
-
-                              return Card(
-                                margin: const EdgeInsets.only(bottom: 10),
-                                child: Padding(
-                                  padding: const EdgeInsets.all(12),
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        item.subject,
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text('\${item.date} • \${meta.join(' • ')}'),
-                                      if (zoomCfg != null &&
-                                          zoomCfg.mode == 'credentials') ...[
-                                        const SizedBox(height: 8),
-                                        Wrap(
-                                          spacing: 8,
-                                          runSpacing: 6,
-                                          children: [
-                                            if ((zoomCfg.meetingCode ?? '').isNotEmpty)
-                                              ActionChip(
-                                                avatar: const Icon(Icons.copy, size: 16),
-                                                label: Text('Код: \${zoomCfg.meetingCode}'),
-                                                onPressed: () => _copy(
-                                                  'Код конференції',
-                                                  zoomCfg.meetingCode!,
-                                                ),
-                                              ),
-                                            if ((zoomCfg.password ?? '').isNotEmpty)
-                                              ActionChip(
-                                                avatar: const Icon(Icons.copy, size: 16),
-                                                label: Text('Пароль: \${zoomCfg.password}'),
-                                                onPressed: () => _copy(
-                                                  'Пароль конференції',
-                                                  zoomCfg.password!,
-                                                ),
-                                              ),
-                                          ],
-                                        ),
-                                      ],
-                                      const SizedBox(height: 10),
-                                      Wrap(
-                                        spacing: 8,
-                                        runSpacing: 8,
-                                        children: [
-                                          if (zoomCfg != null)
-                                            FilledButton.icon(
-                                              onPressed: () => _launchZoom(zoomCfg),
-                                              icon: const Icon(Icons.videocam, size: 18),
-                                              label: const Text('Увійти в Zoom'),
-                                            )
-                                          else
-                                            OutlinedButton.icon(
-                                              onPressed: () => _openUrl(kMoodleUrl),
-                                              icon: const Icon(Icons.open_in_new, size: 18),
-                                              label: const Text('Знайти в Moodle'),
-                                            ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+      
