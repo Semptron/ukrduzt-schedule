@@ -130,6 +130,10 @@ TEXT_DATE_RE = re.compile(
     r"\b(\d{1,2})\s+(січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+(\d{4})\b",
     re.IGNORECASE,
 )
+ANY_FULL_DATE_TOKEN_RE = re.compile(
+    r"(?:\b\d{1,2}\.\d{2}\.\d{4}\b|\b\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\b)",
+    re.IGNORECASE,
+)
 
 BELLS: dict[int, tuple[str, str]] = {
     1: ("09:00", "10:20"),
@@ -175,6 +179,17 @@ def clean_cell(text: str | None) -> str:
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line and line != "|"]
     return " ".join(lines).strip()
+
+
+def _split_cell_lines(text: str | None) -> list[str]:
+    if not text:
+        return []
+    out: list[str] = []
+    for line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        if cleaned and cleaned != "|":
+            out.append(cleaned)
+    return out
 
 
 def _fix_ocr_initials(text: str) -> str:
@@ -288,16 +303,21 @@ def _infer_year_for_month(month_num: int, fallback_year: str | None = None) -> s
 
 
 def _extract_full_dates_from_text(line: str) -> list[str]:
-    dates: list[str] = []
+    tokens: list[tuple[int, str]] = []
     for m in TEXT_DATE_RE.finditer(line):
         d, m_name, y = m.groups()
         norm = _normalize_date_parts(d, MONTHS_UA[m_name.lower()], y)
-        if norm and norm not in dates:
-            dates.append(norm)
+        if norm:
+            tokens.append((m.start(), norm))
     for m in NUMERIC_DATE_RE.finditer(line):
         d, m_num, y = m.groups()
         norm = _normalize_date_parts(d, m_num, y)
-        if norm and norm not in dates:
+        if norm:
+            tokens.append((m.start(), norm))
+    tokens.sort(key=lambda t: t[0])
+    dates: list[str] = []
+    for _, norm in tokens:
+        if norm not in dates:
             dates.append(norm)
     return dates
 
@@ -347,6 +367,31 @@ def _strip_leading_date_or_weekday(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return s.strip()
+
+
+def _split_text_by_dates(text: str, active_date: str) -> list[tuple[str, str]]:
+    """Splits text into (date_str, segment_text) chunks when dates appear inside a block/cell."""
+    matches = list(ANY_FULL_DATE_TOKEN_RE.finditer(text))
+    if not matches:
+        return [(active_date, text)]
+
+    segments: list[tuple[str, str]] = []
+    if matches[0].start() > 0:
+        prefix = text[: matches[0].start()].strip()
+        if prefix:
+            segments.append((active_date, prefix))
+
+    for idx, m in enumerate(matches):
+        raw_tok = m.group(0)
+        parsed_dates = _extract_full_dates_from_text(raw_tok)
+        seg_date = parsed_dates[0] if parsed_dates else active_date
+        start_pos = m.end()
+        end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[start_pos:end_pos].strip(" ,.;:|()\-–")
+        if body:
+            segments.append((seg_date, body))
+
+    return segments
 
 
 def _extract_groups_from_text(text: str) -> list[str]:
@@ -572,7 +617,7 @@ def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
                 line, fallback_year=fallback_year, allow_short=False
             )
             if line_dates and pair_match:
-                current_date = line_dates[0]
+                current_date = line_dates[-1]
                 pair_nums: list[int] = []
                 for grp_idx in (1, 2, 3):
                     val = pair_match.group(grp_idx)
@@ -681,22 +726,21 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                         continue
 
                     joined_row = " ".join(txt for _, txt in non_empty_cells)
-                    new_date = None
+                    row_dates: list[str] = []
                     for _, txt in non_empty_cells:
-                        dates_in_cell = _extract_full_dates_from_text(txt)
-                        if dates_in_cell:
-                            new_date = dates_in_cell[0]
-                            break
+                        for d in _extract_full_dates_from_text(txt):
+                            if d not in row_dates:
+                                row_dates.append(d)
 
-                    if not new_date and _is_date_header_line(joined_row):
-                        short_dates = _extract_dates_from_text(
+                    if not row_dates and _is_date_header_line(joined_row):
+                        for d in _extract_dates_from_text(
                             joined_row, fallback_year=fallback_year, allow_short=True
-                        )
-                        if short_dates:
-                            new_date = short_dates[0]
+                        ):
+                            if d not in row_dates:
+                                row_dates.append(d)
 
-                    if new_date:
-                        current_date = new_date
+                    if row_dates:
+                        current_date = row_dates[-1]
                         lesson_counter = 0
                         if _is_date_header_line(joined_row) or len(non_empty_cells) == 1:
                             continue
@@ -707,19 +751,26 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
 
                     if group_columns:
                         for col_idx, group_name in group_columns.items():
-                            cell_txt = (
-                                cleaned_cells[col_idx]
-                                if col_idx < len(cleaned_cells)
-                                else ""
-                            )
-                            if not cell_txt:
+                            raw_cell = row[col_idx] if col_idx < len(row) else ""
+                            cell_lines = _split_cell_lines(raw_cell)
+                            if not cell_lines:
                                 continue
 
-                            item = parse_cell_to_lesson(
-                                active_date, group_name, lesson_num, cell_txt, warnings
-                            )
-                            if item:
-                                results.append(item)
+                            local_date = active_date
+                            for c_line in cell_lines:
+                                line_dates = _extract_full_dates_from_text(c_line)
+                                if line_dates:
+                                    local_date = line_dates[-1]
+                                    current_date = local_date
+                                    if _is_date_header_line(c_line):
+                                        continue
+
+                                for seg_date, seg_txt in _split_text_by_dates(c_line, local_date):
+                                    item = parse_cell_to_lesson(
+                                        seg_date, group_name, lesson_num, seg_txt, warnings
+                                    )
+                                    if item:
+                                        results.append(item)
                     else:
                         target_groups = page_groups or ["Загальний потік"]
                         for _, cell_txt in non_empty_cells:
@@ -731,12 +782,13 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                                 continue
                             cell_groups = _extract_groups_from_text(cell_txt)
                             groups_for_cell = cell_groups or target_groups
-                            for g_name in groups_for_cell:
-                                item = parse_cell_to_lesson(
-                                    active_date, g_name, lesson_num, cell_txt, warnings
-                                )
-                                if item:
-                                    results.append(item)
+                            for seg_date, seg_txt in _split_text_by_dates(cell_txt, active_date):
+                                for g_name in groups_for_cell:
+                                    item = parse_cell_to_lesson(
+                                        seg_date, g_name, lesson_num, seg_txt, warnings
+                                    )
+                                    if item:
+                                        results.append(item)
 
     if not results:
         results = _parse_text_fallback(pdf_path)
