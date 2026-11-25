@@ -11,7 +11,7 @@ class TeacherSearchScreen extends StatefulWidget {
 
   const TeacherSearchScreen({
     super.key,
-    this.apiBaseUrl = 'http://10.0.2.2:8000',
+    this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
   });
 
   @override
@@ -26,6 +26,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
   bool _loadingTeachers = true;
   bool _searching = false;
   String? _error;
+  int _searchSeq = 0;
 
   @override
   void initState() {
@@ -78,7 +79,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
       final resp = await http.get(uri).timeout(const Duration(seconds: 8));
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
-        final apiTeachers = (data['teachers'] as List<dynamic>)
+        final apiTeachers = (data['teachers'] as List<dynamic>? ?? [])
             .map((e) => e.toString().trim())
             .where((e) => e.isNotEmpty)
             .toSet();
@@ -91,8 +92,10 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
   }
 
   Future<void> _searchByTeacher(String query) async {
+    final seq = ++_searchSeq;
     final cleaned = query.trim();
     if (cleaned.isEmpty) {
+      if (!mounted) return;
       setState(() {
         _results = [];
         _error = null;
@@ -110,8 +113,9 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
         '${widget.apiBaseUrl}/api/v1/schedule?teacher=${Uri.encodeComponent(cleaned)}',
       );
       final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (!mounted || seq != _searchSeq) return;
+
       if (resp.statusCode == 404) {
-        if (!mounted) return;
         setState(() {
           _results = [];
           _searching = false;
@@ -124,11 +128,10 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
       }
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      final items = (data['items'] as List<dynamic>)
+      final items = (data['items'] as List<dynamic>? ?? [])
           .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
           .toList();
 
-      if (!mounted) return;
       setState(() {
         _results = items;
         _searching = false;
@@ -136,6 +139,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
       });
     } catch (_) {
       final prefs = await SharedPreferences.getInstance();
+      if (!mounted || seq != _searchSeq) return;
       final qLower = cleaned.toLowerCase();
       final fallback = <LessonModel>[];
 
@@ -152,7 +156,6 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
         }
       }
 
-      if (!mounted) return;
       setState(() {
         _results = fallback;
         _searching = false;
@@ -257,6 +260,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
                       IconButton(
                         icon: const Icon(Icons.clear),
                         onPressed: () {
+                          _searchSeq++;
                           _searchController.clear();
                           setState(() {
                             _results = [];
