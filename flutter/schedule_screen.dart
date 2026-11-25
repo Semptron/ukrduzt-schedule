@@ -11,9 +11,45 @@ const String kZoomAppUrl = 'https://zoom.us/join';
 const String kMeetingsPrefsKey = 'ukrduzt_zoom_configs_v1';
 const String kNotesPrefsKey = 'ukrduzt_lesson_notes_v1';
 const String kSelectedGroupPrefsKey = 'ukrduzt_selected_group_v1';
-const String kGroupsCachePrefsKey = 'ukrduzt_groups_cache_v1';
+const String kGroupsCachePrefsKey = 'ukrduzt_groups_cache_v2';
 
 String _scheduleCacheKey(String group) => 'ukrduzt_schedule_cache_$group';
+
+bool _isValidGroupName(String raw) {
+  final s = raw.trim();
+  if (s.isEmpty || s.length > 32) return false;
+
+  final lower = s.toLowerCase();
+  const forbiddenFragments = [
+    'курс',
+    'факультет',
+    'денна форма',
+    'заочна форма',
+    'навчальн',
+    'розклад',
+    'семестр',
+    'упп',
+    'економічний',
+  ];
+  for (final frag in forbiddenFragments) {
+    if (lower.contains(frag)) return false;
+  }
+
+  // Назви груп зазвичай містять цифри та/або дефіс (наприклад, 101-ЛЛГ-326)
+  return RegExp(r'[0-9]').hasMatch(s) || s.contains('-');
+}
+
+List<String> _sanitizeGroups(Iterable<dynamic> rawList) {
+  final seen = <String>{};
+  final cleaned = <String>[];
+  for (final item in rawList) {
+    final g = item.toString().trim();
+    if (_isValidGroupName(g) && seen.add(g)) {
+      cleaned.add(g);
+    }
+  }
+  return cleaned;
+}
 
 class BellSlot {
   final int number;
@@ -100,19 +136,22 @@ class LessonModel {
   });
 
   factory LessonModel.fromJson(Map<String, dynamic> json) {
-    final lessonNum = json['lesson_number'] as int;
+    final rawNum = json['lesson_number'];
+    final lessonNum = rawNum is int
+        ? rawNum
+        : int.tryParse(rawNum?.toString() ?? '') ?? 1;
     final bell = kBells.cast<BellSlot?>().firstWhere(
           (b) => b?.number == lessonNum,
           orElse: () => null,
         );
 
     return LessonModel(
-      date: json['date'] as String,
-      group: json['group'] as String,
+      date: (json['date'] ?? '').toString(),
+      group: (json['group'] ?? '').toString(),
       lessonNumber: lessonNum,
       timeStart: (json['time_start'] as String?) ?? bell?.start ?? '00:00',
       timeEnd: (json['time_end'] as String?) ?? bell?.end ?? '00:00',
-      subject: json['subject'] as String,
+      subject: (json['subject'] ?? 'Без назви').toString(),
       lessonType: json['lesson_type'] as String?,
       teacher: json['teacher'] as String?,
       serverMeetingUrl: json['meeting_url'] as String?,
@@ -161,7 +200,7 @@ class ScheduleScreen extends StatefulWidget {
 
   const ScheduleScreen({
     super.key,
-    this.apiBaseUrl = 'http://10.0.2.2:8000',
+    this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
     this.initialGroup = '101-ЛЛГ-326',
   });
 
@@ -202,8 +241,10 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     final prefs = await SharedPreferences.getInstance();
 
     final savedGroup = prefs.getString(kSelectedGroupPrefsKey);
-    if (savedGroup != null && savedGroup.isNotEmpty) {
-      _selectedGroup = savedGroup;
+    if (savedGroup != null &&
+        savedGroup.isNotEmpty &&
+        _isValidGroupName(savedGroup)) {
+      _selectedGroup = savedGroup.trim();
     }
 
     final rawMeetings = prefs.getString(kMeetingsPrefsKey);
@@ -225,7 +266,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     final rawGroups = prefs.getString(kGroupsCachePrefsKey);
     if (rawGroups != null && rawGroups.isNotEmpty) {
-      _groups = List<String>.from(jsonDecode(rawGroups) as List<dynamic>);
+      _groups = _sanitizeGroups(jsonDecode(rawGroups) as List<dynamic>);
     }
     if (!_groups.contains(_selectedGroup)) {
       _groups = [_selectedGroup, ..._groups];
@@ -331,20 +372,28 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   Future<void> _fetchGroups(SharedPreferences prefs) async {
     try {
       final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/groups');
-      final resp = await http.get(uri).timeout(const Duration(seconds: 8));
+      final resp = await http.get(uri).timeout(const Duration(seconds: 65));
       if (resp.statusCode != 200) return;
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      final list = (data['groups'] as List<dynamic>).map((e) => e.toString()).toList();
+      final rawList = (data['groups'] as List<dynamic>? ?? []);
+      final list = _sanitizeGroups(rawList);
 
       if (list.isNotEmpty && mounted) {
+        final nextGroup = list.contains(_selectedGroup)
+            ? _selectedGroup
+            : list.first;
+        final groupChanged = nextGroup != _selectedGroup;
+
         setState(() {
           _groups = list;
-          if (!_groups.contains(_selectedGroup)) {
-            _groups.insert(0, _selectedGroup);
-          }
+          _selectedGroup = nextGroup;
         });
         await prefs.setString(kGroupsCachePrefsKey, jsonEncode(list));
+        if (groupChanged) {
+          await prefs.setString(kSelectedGroupPrefsKey, nextGroup);
+          await _fetchSchedule(prefs, showSpinnerIfEmpty: true);
+        }
       }
     } catch (_) {}
   }
@@ -367,11 +416,27 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       final uri = Uri.parse(
         '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(_selectedGroup)}',
       );
-      final resp = await http.get(uri).timeout(const Duration(seconds: 10));
-      if (resp.statusCode != 200) throw Exception('HTTP ${resp.statusCode}');
+      final resp = await http.get(uri).timeout(const Duration(seconds: 65));
+
+      if (resp.statusCode == 404) {
+        if (!mounted) return;
+        setState(() {
+          _lessons = [];
+          _selectedDate = null;
+          _loading = false;
+          _offlineBanner = false;
+          _error =
+              'Для групи "$_selectedGroup" розклад наразі відсутній на сервері (HTTP 404). Оберіть іншу групу у верхньому списку.';
+        });
+        return;
+      }
+
+      if (resp.statusCode != 200) {
+        throw Exception('HTTP ${resp.statusCode}');
+      }
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      final items = (data['items'] as List<dynamic>)
+      final items = (data['items'] as List<dynamic>? ?? [])
           .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
           .toList();
 
@@ -389,7 +454,9 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                 : _pickInitialDate(items);
         _loading = false;
         _offlineBanner = false;
-        _error = null;
+        _error = items.isEmpty
+            ? 'Сервер повернув порожній розклад для групи "$_selectedGroup".'
+            : null;
       });
     } catch (e) {
       if (!mounted) return;
@@ -637,8 +704,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       now.year,
       now.month,
       now.day,
-      int.parse(parts[0]),
-      int.parse(parts[1]),
+      int.tryParse(parts.isNotEmpty ? parts[0] : '0') ?? 0,
+      int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0,
     );
   }
 
@@ -698,7 +765,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       appBar: AppBar(
         title: DropdownButtonHideUnderline(
           child: DropdownButton<String>(
-            value: _selectedGroup,
+            value: _groups.contains(_selectedGroup) ? _selectedGroup : null,
+            hint: Text(_selectedGroup),
             items: _groups
                 .map((g) => DropdownMenuItem<String>(value: g, child: Text(g)))
                 .toList(),
