@@ -33,7 +33,7 @@ def _normalize_query_text(value: str | None) -> str | None:
     return cleaned or None
 
 
-def _execute_sync_safe() -> dict[str, Any] | None:
+def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
     global _sync_in_progress, _last_sync_stats, _last_sync_error
 
     if not _sync_lock.acquire(blocking=False):
@@ -41,7 +41,7 @@ def _execute_sync_safe() -> dict[str, Any] | None:
 
     _sync_in_progress = True
     try:
-        stats = run_sync()
+        stats = run_sync(force=force)
         _last_sync_stats = stats
         _last_sync_error = None
         logger.info("Schedule sync finished: %s", stats)
@@ -58,7 +58,7 @@ def _execute_sync_safe() -> dict[str, Any] | None:
 async def background_sync_loop() -> None:
     while True:
         try:
-            await asyncio.to_thread(_execute_sync_safe)
+            await asyncio.to_thread(_execute_sync_safe, False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -129,28 +129,13 @@ def get_schedule(
         date=clean_date,
     )
 
-    if not items and clean_teacher and "." in clean_teacher:
-        surname_only = clean_teacher.split()[0]
-        if len(surname_only) >= 3:
-            candidate_items = query_lessons(
-                group=clean_group,
-                teacher=surname_only,
-                date=clean_date,
-            )
-            norm_target = clean_teacher.lower().replace(" ", "")
-            items = [
-                item
-                for item in candidate_items
-                if norm_target in (item.get("teacher") or "").lower().replace(" ", "")
-            ]
-
     if not items:
         raise HTTPException(status_code=404, detail="Розклад не знайдено")
     return {"items": items}
 
 
 @app.post("/api/v1/sync")
-def trigger_sync():
+def trigger_sync(force: bool = Query(False, description="Примусово перепарсити всі файли")):
     if _sync_in_progress:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
@@ -161,12 +146,15 @@ def trigger_sync():
             },
         )
 
-    thread = threading.Thread(target=_execute_sync_safe, daemon=True)
+    thread = threading.Thread(
+        target=_execute_sync_safe, args=(force,), daemon=True
+    )
     thread.start()
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
             "status": "started",
+            "force": force,
             "last_stats": _last_sync_stats,
             "last_error": _last_sync_error,
         },
