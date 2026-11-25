@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import re
+import time
 from pathlib import Path
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -15,20 +16,31 @@ FILE_EXT_RE = re.compile(r"\.(pdf|xlsx|xls)$", re.IGNORECASE)
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; UkrDUZT-Schedule-Sync/1.0)"
 }
+MAX_DOWNLOAD_RETRIES = 3
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
-    with httpx.Client(
-        timeout=20.0, follow_redirects=True, headers=DEFAULT_HEADERS
-    ) as client:
-        resp = client.get(portal_url)
-        resp.raise_for_status()
+def _download_with_retry(client: httpx.Client, url: str) -> bytes:
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_DOWNLOAD_RETRIES:
+                time.sleep(1.5 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+
+def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
+    content = _download_with_retry_text(portal_url)
+    soup = BeautifulSoup(content, "html.parser")
     links: set[str] = set()
 
     for tag in soup.find_all("a", href=True):
@@ -43,6 +55,24 @@ def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
     return sorted(links)
 
 
+def _download_with_retry_text(url: str) -> str:
+    last_exc: Exception | None = None
+    with httpx.Client(
+        timeout=25.0, follow_redirects=True, headers=DEFAULT_HEADERS
+    ) as client:
+        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+            try:
+                resp = client.get(url)
+                resp.raise_for_status()
+                return resp.text
+            except Exception as exc:
+                last_exc = exc
+                if attempt < MAX_DOWNLOAD_RETRIES:
+                    time.sleep(1.5 * attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
 def run_sync() -> dict:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     urls = fetch_schedule_links()
@@ -51,14 +81,12 @@ def run_sync() -> dict:
     total_lessons_saved = 0
 
     with httpx.Client(
-        timeout=30.0, follow_redirects=True, headers=DEFAULT_HEADERS
+        timeout=35.0, follow_redirects=True, headers=DEFAULT_HEADERS
     ) as client:
         for url in urls:
             local_path: Path | None = None
             try:
-                resp = client.get(url)
-                resp.raise_for_status()
-                content = resp.content
+                content = _download_with_retry(client, url)
                 if not content:
                     raise ValueError("Empty file downloaded")
 
