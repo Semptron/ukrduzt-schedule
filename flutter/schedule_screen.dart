@@ -238,7 +238,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   void initState() {
     super.initState();
     _selectedGroup = widget.initialGroup;
-    _selectedDate = _formatDateDdMmYyyy(DateTime.now());
     _initScreen();
     _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted) setState(() {});
@@ -293,6 +292,10 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         _selectedDate ??= _pickInitialDate(cachedLessons);
         _loading = false;
       });
+    } else if (mounted) {
+      setState(() {
+        _selectedDate ??= _formatDateDdMmYyyy(DateTime.now());
+      });
     }
 
     await _fetchGroups(prefs);
@@ -302,9 +305,16 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   String _pickInitialDate(List<LessonModel> items) {
     final today = _dateOnly(DateTime.now());
     final todayStr = _formatDateDdMmYyyy(today);
-    final dates = _sortedDates(items, fromTodayOnly: true);
-    if (dates.contains(todayStr)) return todayStr;
-    if (dates.isNotEmpty) return dates.first;
+    final hasTodayLessons = items.any((l) => l.date.trim() == todayStr);
+    if (hasTodayLessons) return todayStr;
+
+    final upcomingDates = _sortedDates(items, fromTodayOnly: true)
+        .where((d) => items.any((l) => l.date.trim() == d))
+        .toList();
+    if (upcomingDates.isNotEmpty) return upcomingDates.first;
+
+    final allDates = _sortedDates(items, fromTodayOnly: false);
+    if (allDates.isNotEmpty) return allDates.first;
     return todayStr;
   }
 
@@ -375,13 +385,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   Future<void> _saveZoomConfig(LessonModel lesson, ZoomAccessConfig? cfg) async {
     final key = buildMeetingKey(subject: lesson.subject, teacher: lesson.teacher);
-    setState(() {
-      if (cfg == null || !cfg.hasAnyData) {
-        _zoomConfigs.remove(key);
-      } else {
-        _zoomConfigs[key] = cfg;
-      }
-    });
+    if (mounted) {
+      setState(() {
+        if (cfg == null || !cfg.hasAnyData) {
+          _zoomConfigs.remove(key);
+        } else {
+          _zoomConfigs[key] = cfg;
+        }
+      });
+    }
 
     final prefs = await SharedPreferences.getInstance();
     final encoded = _zoomConfigs.map((k, v) => MapEntry(k, v.toJson()));
@@ -392,13 +404,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     final key = buildNoteKey(lesson);
     final cleaned = (note ?? '').trim();
 
-    setState(() {
-      if (cleaned.isEmpty) {
-        _lessonNotes.remove(key);
-      } else {
-        _lessonNotes[key] = cleaned;
-      }
-    });
+    if (mounted) {
+      setState(() {
+        if (cleaned.isEmpty) {
+          _lessonNotes.remove(key);
+        } else {
+          _lessonNotes[key] = cleaned;
+        }
+      });
+    }
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(kNotesPrefsKey, jsonEncode(_lessonNotes));
@@ -408,13 +422,13 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     try {
       final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/groups');
       final resp = await http.get(uri).timeout(const Duration(seconds: 65));
-      if (resp.statusCode != 200) return;
+      if (resp.statusCode != 200 || !mounted) return;
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
       final rawList = (data['groups'] as List<dynamic>? ?? []);
       final list = _sanitizeGroups(rawList);
 
-      if (list.isNotEmpty && mounted) {
+      if (list.isNotEmpty) {
         final nextGroup = list.contains(_selectedGroup)
             ? _selectedGroup
             : list.first;
@@ -700,11 +714,13 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       ),
     );
 
-    urlController.dispose();
-    codeController.dispose();
-    passController.dispose();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      urlController.dispose();
+      codeController.dispose();
+      passController.dispose();
+    });
 
-    if (result != null) {
+    if (result != null && mounted) {
       await _saveZoomConfig(lesson, result);
     }
   }
@@ -738,18 +754,21 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       ),
     );
 
-    controller.dispose();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      controller.dispose();
+    });
 
-    if (result != null) await _saveNote(lesson, result);
+    if (result != null && mounted) await _saveNote(lesson, result);
   }
 
-  DateTime _parseTodayTime(String hhmm) {
-    final now = DateTime.now();
+  DateTime? _parseLessonDateTime(String dateDdMmYyyy, String hhmm) {
+    final baseDate = _tryParseDdMmYyyy(dateDdMmYyyy);
+    if (baseDate == null) return null;
     final parts = hhmm.split(':');
     return DateTime(
-      now.year,
-      now.month,
-      now.day,
+      baseDate.year,
+      baseDate.month,
+      baseDate.day,
       int.tryParse(parts.isNotEmpty ? parts[0] : '0') ?? 0,
       int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0,
     );
@@ -757,8 +776,9 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   double _lessonProgress(LessonModel lesson) {
     final now = DateTime.now();
-    final start = _parseTodayTime(lesson.timeStart);
-    final end = _parseTodayTime(lesson.timeEnd);
+    final start = _parseLessonDateTime(lesson.date, lesson.timeStart);
+    final end = _parseLessonDateTime(lesson.date, lesson.timeEnd);
+    if (start == null || end == null) return 0;
     final total = end.difference(start).inSeconds;
     if (total <= 0) return 0;
     final elapsed = now.difference(start).inSeconds;
@@ -767,15 +787,23 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   String _liveStatusText(LessonModel lesson) {
     final now = DateTime.now();
-    final start = _parseTodayTime(lesson.timeStart);
-    final end = _parseTodayTime(lesson.timeEnd);
+    final start = _parseLessonDateTime(lesson.date, lesson.timeStart);
+    final end = _parseLessonDateTime(lesson.date, lesson.timeEnd);
+    if (start == null || end == null) {
+      return '${lesson.timeStart}\u2013${lesson.timeEnd}';
+    }
 
     if (now.isAfter(start) && now.isBefore(end)) {
       final minsLeft = end.difference(now).inMinutes + 1;
       return 'Йде зараз \u2022 до кінця $minsLeft хв';
     }
     if (now.isBefore(start)) {
-      final minsToStart = start.difference(now).inMinutes + 1;
+      final diff = start.difference(now);
+      if (diff.inHours >= 24) {
+        final days = diff.inDays;
+        return 'Заплановано (${lesson.date}, через $days дн.)';
+      }
+      final minsToStart = diff.inMinutes + 1;
       return 'Початок через $minsToStart хв';
     }
     return 'Завершено';
@@ -783,18 +811,21 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
   LessonModel? _findActiveOrNextLesson(List<LessonModel> allLessons) {
     final todayStr = _formatDateDdMmYyyy(DateTime.now());
-    final todayItems = allLessons.where((l) => l.date == todayStr).toList()
+    final todayItems = allLessons.where((l) => l.date.trim() == todayStr).toList()
       ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
     if (todayItems.isEmpty) return null;
 
     final now = DateTime.now();
     for (final l in todayItems) {
-      final start = _parseTodayTime(l.timeStart);
-      final end = _parseTodayTime(l.timeEnd);
-      if (now.isAfter(start) && now.isBefore(end)) return l;
+      final start = _parseLessonDateTime(l.date, l.timeStart);
+      final end = _parseLessonDateTime(l.date, l.timeEnd);
+      if (start != null && end != null && now.isAfter(start) && now.isBefore(end)) {
+        return l;
+      }
     }
     for (final l in todayItems) {
-      if (now.isBefore(_parseTodayTime(l.timeStart))) return l;
+      final start = _parseLessonDateTime(l.date, l.timeStart);
+      if (start != null && now.isBefore(start)) return l;
     }
     return null;
   }
@@ -812,7 +843,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       return copy;
     }
 
-    final dayItems = _lessons.where((l) => l.date == activeDate).toList()
+    final dayItems = _lessons.where((l) => l.date.trim() == activeDate.trim()).toList()
       ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
     return dayItems;
   }
@@ -985,9 +1016,10 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                               final note = _lessonNotes[buildNoteKey(item)];
                               final metaParts = <String>[
                                 '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
-                                'Онлайн',
-                                if (item.lessonType != null) item.lessonType!,
-                                if (item.teacher != null) item.teacher!,
+                                if (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
+                                  item.lessonType!.trim(),
+                                if (item.teacher != null && item.teacher!.trim().isNotEmpty)
+                                  item.teacher!.trim(),
                               ];
 
                               return Card(
