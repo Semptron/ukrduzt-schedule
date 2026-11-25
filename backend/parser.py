@@ -50,6 +50,10 @@ FRAGMENT_NOISE_RE = re.compile(
     r"^(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лк|пр|лаб)$",
     re.IGNORECASE,
 )
+GARBAGE_SUBJECT_RE = re.compile(
+    r"^(?:інд|ирап|пари|пар|інд\.?\s*конс\.?|конс\.?|екз\.?|залік)$",
+    re.IGNORECASE,
+)
 
 TEACHER_NOISE_TAIL_RE = re.compile(
     r"(?:,?\s*\b(?:інд\.?\s*конс\w*|індив\w*\s*конс\w*|конс\w*|екз\.?|залік|м|лекц\w*|практ\w*|лаб\w*)\b\.?)+$",
@@ -104,7 +108,6 @@ TEACHER_STOPWORDS = {
     "м",
     "і",
     "та",
-
 }
 
 MONTHS_UA = {
@@ -191,7 +194,7 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
         cleaned,
     )
     cleaned = re.sub(
-        r"\b([А-ЯІЇЄҐA-Z])\s+([А-ЯІЇЄҐA-Z])\s*$",
+        r"([А-ЯІЇЄҐA-Z])\.?\s+([А-ЯІЇЄҐA-Z])\.?$",
         r"\1. \2.",
         cleaned,
     )
@@ -212,6 +215,8 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
         w_clean = w.strip(".,;:-")
         if not w_clean:
             continue
+        if len(w_clean) == 1 and w.endswith("."):
+            continue
         if MIXED_SCRIPT_WORD_RE.match(w_clean) or WEIRD_CASE_WORD_RE.match(w_clean):
             return None
         if w_clean.lower() in TEACHER_STOPWORDS:
@@ -224,7 +229,6 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
         return cleaned
 
     return None
-
 
 def detect_lesson_number(row: list[str | None], fallback_counter: int) -> int:
     for cell in row:
@@ -376,7 +380,9 @@ def _extract_subject_and_teacher(parts: list[str], cleaned: str) -> tuple[str, s
         subject_parts.append(p)
 
     subject = ", ".join(subject_parts).strip() if subject_parts else (parts[0] if parts else cleaned)
-    subject = re.sub(r"\s+", " ", subject).strip(" ,;-") or "Заняття"
+    subject = re.sub(r"\s+", " ", subject).strip(" ,;-")
+    if not subject or GARBAGE_SUBJECT_RE.match(subject):
+        return "", teacher
     return subject, teacher
 
 
@@ -398,6 +404,7 @@ def parse_cell_to_lesson(
         WEEKDAY_RE.match(cleaned)
         or HEADER_NOISE_RE.match(cleaned)
         or FRAGMENT_NOISE_RE.match(cleaned)
+        or GARBAGE_SUBJECT_RE.match(cleaned)
     ):
         return None
 
@@ -416,6 +423,11 @@ def parse_cell_to_lesson(
 
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
     subject, teacher = _extract_subject_and_teacher(parts, cleaned)
+    if not subject:
+        return None
+
+    if not lesson_type and not room and not meeting_url:
+        return None
 
     if not lesson_type or (not room and not meeting_url):
         warnings.append(
