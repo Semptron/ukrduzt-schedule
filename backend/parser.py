@@ -54,7 +54,7 @@ LESSON_TYPE_RE = re.compile(
     r"\b(лк|пр|лаб|лік|лек|інд\.?\s*конс\.?|конс\.?|лекц\w*|практ\w*|лаб\w*)\b\.?",
     re.IGNORECASE,
 )
-ROOM_RE = re.compile(r"\b\d+\.[А-ЯІЇЄҐA-Z0-9]+\b")
+ROOM_RE = re.compile(r"\b\d+\.[А-Яа-яІіЇїЄєҐґA-Za-z0-9]{1,12}\b")
 URL_RE = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
 ZOOM_RE = re.compile(r"https?://(?:[a-z0-9-]+\.)*zoom\.us/[^\s,;]+", re.IGNORECASE)
 
@@ -96,7 +96,7 @@ TEACHER_EXACT_NOISE = {
     "інд. консульт.", "індив. консульт.", "індивід. консультація",
 }
 SURNAME_WITH_INITIALS_RE = re.compile(
-    r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.?(?:\s*[А-ЯІЇЄҐ]\.?){0,2}$"
+    r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.(?:\s*[А-ЯІЇЄҐ]\.){0,2}$"
 )
 FULL_NAME_RE = re.compile(
     r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}"
@@ -297,28 +297,59 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
     cleaned = re.sub(r"\s+", " ", raw_teacher).strip(" ,;|")
     cleaned = cleaned.replace("Ο.", "О.")
     cleaned = re.sub(
-        r"(\b[А-ЯІЇЄҐ][а-яіїєґ'\u2019`-]+\s+[А-ЯІЇЄҐ]\.\s*)[L1I]\b\.?",
+        r"(\b[А-ЯІЇЄҐ][а-яіїєґ'’`-]+\s+[А-ЯІЇЄҐ]\.\s*)[L1I]\b\.?",
         r"\1І.",
         cleaned,
     )
     cleaned = TEACHER_NOISE_HEAD_RE.sub("", cleaned).strip(" ,;|")
     cleaned = TEACHER_NOISE_TAIL_RE.sub("", cleaned).strip(" ,;|")
+    # Strip trailing lesson-type crumbs: "Резуненко М.Є.лек" → "Резуненко М.Є."
+    cleaned = re.sub(
+        r"(?<=[\s.])(?:лк|пр|лаб|лек|практ)\.?$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;|")
     if not cleaned:
         return None
     cleaned = re.sub(
-        r"\b([А-ЯІЇЄҐA-Z])\.([А-ЯІЇЄҐA-Z])(?=\.|\s|$)",
+        r"\b([А-ЯІЇЄҐA-Z])\.([А-ЯІЇЄҐA-Z])\.?",
         r"\1. \2.",
         cleaned,
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;|")
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
+    if re.search(r"[А-ЯІЇЄҐ]$", cleaned):
+        cleaned += "."
     lower = cleaned.lower()
     if lower in TEACHER_EXACT_NOISE:
+        return None
+    # Rooms, URLs, zoom tokens, pure codes
+    if ROOM_RE.fullmatch(cleaned) or (ROOM_RE.search(cleaned) and len(cleaned) <= 10):
+        return None
+    if re.search(r"https?://|zoom\.us|pwd=|passcode", cleaned, re.I):
+        return None
+    if re.fullmatch(r"[A-Za-z0-9+/=_-]{16,}", cleaned):
+        return None  # base64 / meeting tokens
+    if re.fullmatch(r"[\d.]+[а-яіїєґa-z]?", cleaned, re.I):
         return None
     if any(sw in lower for sw in TEACHER_STOPWORDS) and not SURNAME_WITH_INITIALS_RE.match(
         cleaned
     ):
         return None
-    return cleaned
+    # Must look like a person name (full match). Initials need dots: "О." / "О. О."
+    if SURNAME_WITH_INITIALS_RE.fullmatch(cleaned) or FULL_NAME_RE.fullmatch(cleaned):
+        return cleaned
+    if re.fullmatch(
+        r"[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.(?:\s*[А-ЯІЇЄҐ]\.){0,2}",
+        cleaned,
+    ):
+        return cleaned
+    # "Прізвище І." without trailing space noise
+    if re.fullmatch(r"[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.", cleaned):
+        return cleaned
+    return None
 
 
 def detect_lesson_number(row: list, fallback_counter: int) -> int:
@@ -386,20 +417,50 @@ def _extract_subject_and_teacher(parts, cleaned):
     teacher = None
     subject_parts = []
     for p in parts:
+        p = p.strip()
+        if not p:
+            continue
         if ROOM_RE.fullmatch(p) or LESSON_TYPE_RE.fullmatch(p) or FRAGMENT_NOISE_RE.match(p):
             continue
         if _extract_full_dates_from_text(p):
+            continue
+        if re.search(r"https?://|zoom\.us", p, re.I):
             continue
         cand = normalize_teacher_name(p)
         if cand and not teacher:
             teacher = cand
             continue
+        # Try to peel teacher from end of a long part: "Subject Teacher Init."
+        peeled = re.match(
+            r"^(.+?)\s+([А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.?(?:\s*[А-ЯІЇЄҐ]\.?){0,2})$",
+            p,
+        )
+        if peeled and not teacher:
+            subj_bit, maybe_t = peeled.group(1).strip(" ,;-"), peeled.group(2)
+            nt = normalize_teacher_name(maybe_t)
+            if nt:
+                teacher = nt
+                p = subj_bit
         if GARBAGE_SUBJECT_RE.match(p):
+            continue
+        if ROOM_RE.fullmatch(p):
             continue
         subject_parts.append(p)
 
-    subject = ", ".join(subject_parts).strip() if subject_parts else (parts[0] if parts else cleaned)
+    subject = ", ".join(subject_parts).strip() if subject_parts else ""
+    if not subject and parts:
+        # last resort: whole cell minus known teacher/room/type
+        subject = cleaned
+        if teacher:
+            subject = subject.replace(teacher, " ")
+        subject = ROOM_RE.sub(" ", subject)
+        subject = LESSON_TYPE_RE.sub(" ", subject)
+        subject = re.sub(r"\s+", " ", subject).strip(" ,;-")
     subject = re.sub(r"\s+", " ", subject).strip(" ,;-")
+    # Drop trailing teacher echo inside subject
+    if teacher and teacher in subject:
+        subject = subject.replace(teacher, " ").strip(" ,;-")
+        subject = re.sub(r"\s+", " ", subject).strip(" ,;-")
     if not subject or GARBAGE_SUBJECT_RE.match(subject):
         return "", teacher
     return subject, teacher
@@ -447,6 +508,9 @@ def parse_cell_to_lesson(date_str, group, lesson_number, raw_text, warnings):
 
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
     subject, teacher = _extract_subject_and_teacher(parts, cleaned)
+    if not subject and lesson_type and teacher:
+        # e.g. "інд. конс. Панчук О. В."
+        subject = lesson_type
     if not subject:
         return None
 
@@ -472,6 +536,15 @@ def parse_cell_to_lesson(date_str, group, lesson_number, raw_text, warnings):
                 raw=cleaned,
             )
         )
+
+    # If room still missing, try again on cleaned text with fixed ROOM_RE
+    if not room:
+        rm = ROOM_RE.search(cleaned)
+        if rm:
+            room = rm.group(0)
+
+    # Never store room/url as teacher
+    teacher = normalize_teacher_name(teacher)
 
     time_start, time_end = BELLS.get(lesson_number, ("00:00", "00:00"))
     return LessonItem(
