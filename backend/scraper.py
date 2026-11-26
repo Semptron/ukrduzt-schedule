@@ -13,10 +13,20 @@ logger = logging.getLogger("ukrduzt-scraper")
 PORTAL_URL = "https://kart.edu.ua/osvita/portal-rz"
 DOWNLOAD_DIR = Path("downloads")
 FILE_EXT_RE = re.compile(r"\.(pdf|xlsx|xls)$", re.IGNORECASE)
+# Educational-process charts, scans of orders, etc. — not lesson tables
+SKIP_NAME_RE = re.compile(
+    r"(grafik|графік|adobe-scan|scan-|порядок|наказ|положен)",
+    re.IGNORECASE,
+)
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; UkrDUZT-Schedule-Sync/1.0)"
 }
 MAX_DOWNLOAD_RETRIES = 3
+
+
+def _should_skip_url(url: str) -> bool:
+    name = Path(url.split("?", 1)[0]).name
+    return bool(SKIP_NAME_RE.search(name))
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -49,8 +59,12 @@ def fetch_schedule_links(portal_url: str = PORTAL_URL) -> list[str]:
             continue
         full_url = urljoin(portal_url, href)
         clean_path = full_url.split("?", 1)[0]
-        if FILE_EXT_RE.search(clean_path):
-            links.add(full_url)
+        if not FILE_EXT_RE.search(clean_path):
+            continue
+        if _should_skip_url(clean_path):
+            logger.info("Skip non-schedule file: %s", Path(clean_path).name)
+            continue
+        links.add(full_url)
 
     return sorted(links)
 
@@ -106,7 +120,10 @@ def run_sync(force: bool = False) -> dict:
                     warnings = parsed_bundle.get("warnings") or []
 
                     if not lessons:
-                        raise ValueError(f"Zero lessons parsed from {raw_name}")
+                        # Mark hash so we do not retry every hour; not a hard failure
+                        logger.info("No lessons in %s — skip", raw_name)
+                        replace_source_lessons(url, file_hash, [], 0)
+                        continue
 
                     replace_source_lessons(url, file_hash, lessons, len(warnings))
                     updated_files += 1
