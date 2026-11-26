@@ -263,7 +263,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     _selectedGroup = widget.initialGroup;
     _initScreen();
     _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      // The live "in progress / starts in X min" status only matters for the
+      // featured card on the single-day view. In "all days" mode the ticker
+      // would rebuild a potentially long list for no reason, so skip it.
+      if (_showAllDates) return;
+      setState(() {});
     });
   }
 
@@ -459,7 +464,15 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
         setState(() {
           _groups = list;
-          _selectedGroup = nextGroup;
+          if (groupChanged) {
+            // Avoid showing the previous group's lessons under the new group
+            // name while the fresh schedule is being fetched.
+            _selectedGroup = nextGroup;
+            _lessons = [];
+            _selectedDate = null;
+            _loading = true;
+            _error = null;
+          }
         });
         await prefs.setString(kGroupsCachePrefsKey, jsonEncode(list));
         if (groupChanged) {
@@ -570,6 +583,24 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     });
 
     await _fetchSchedule(prefs, showSpinnerIfEmpty: cached.isEmpty);
+  }
+
+  /// User tapped the "Спробувати знову" button on the error panel.
+  Future<void> _retryFetch() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _error = null;
+      _loading = _lessons.isEmpty;
+    });
+    await _fetchSchedule(prefs, showSpinnerIfEmpty: _lessons.isEmpty);
+  }
+
+  /// Pull-to-refresh handler — clears the error and forces a network fetch.
+  Future<void> _handleRefresh() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() => _error = null);
+    await _fetchSchedule(prefs, showSpinnerIfEmpty: false);
   }
 
   Future<void> _openExternalUrl(String url) async {
@@ -994,13 +1025,35 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
               ),
             ),
           Expanded(
-            child: _loading
+            child: RefreshIndicator(
+              onRefresh: _handleRefresh,
+              child: _loading
                 ? const Center(child: CircularProgressIndicator())
                 : _error != null
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(16),
-                          child: Text(_error!, textAlign: TextAlign.center),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.cloud_off,
+                                size: 48,
+                                color: Colors.grey,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                _error!,
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 16),
+                              FilledButton.icon(
+                                onPressed: _retryFetch,
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('Спробувати знову'),
+                              ),
+                            ],
+                          ),
                         ),
                       )
                     : visibleLessons.isEmpty
@@ -1161,6 +1214,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                               );
                             },
                           ),
+            ),
           ),
         ],
       ),
