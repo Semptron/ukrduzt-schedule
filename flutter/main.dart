@@ -53,7 +53,10 @@ class _MainShellState extends State<_MainShell> {
   Widget build(BuildContext context) {
     final pages = [
       ScheduleScreen(apiBaseUrl: widget.apiBaseUrl),
-      TeacherSearchScreen(apiBaseUrl: widget.apiBaseUrl),
+      TeacherSearchScreen(
+        apiBaseUrl: widget.apiBaseUrl,
+        isActive: _index == 1,
+      ),
     ];
 
     return Scaffold(
