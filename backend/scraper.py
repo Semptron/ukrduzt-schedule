@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 import httpx
 from database import get_file_hash, replace_source_lessons
 from parser import parse_schedule_pdf_detailed
+from quality import sanitize_lessons
 
 logger = logging.getLogger("ukrduzt-scraper")
 PORTAL_URL = "https://kart.edu.ua/osvita/portal-rz"
@@ -116,11 +117,10 @@ def run_sync(force: bool = False) -> dict:
                 ext = local_path.suffix.lower()
                 if ext == ".pdf":
                     parsed_bundle = parse_schedule_pdf_detailed(str(local_path))
-                    lessons = parsed_bundle.get("lessons") or []
+                    lessons = sanitize_lessons(parsed_bundle.get("lessons") or [])
                     warnings = parsed_bundle.get("warnings") or []
 
                     if not lessons:
-                        # Mark hash so we do not retry every hour; not a hard failure
                         logger.info("No lessons in %s — skip", raw_name)
                         replace_source_lessons(url, file_hash, [], 0)
                         continue
