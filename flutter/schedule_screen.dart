@@ -493,70 +493,104 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       });
     }
 
-    try {
-      final uri = Uri.parse(
-        '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}',
-      );
-      final resp = await http.get(uri).timeout(const Duration(seconds: 65));
+    const retryDelays = [
+      Duration.zero,
+      Duration(seconds: 4),
+      Duration(seconds: 8),
+    ];
 
+    for (var attempt = 0; attempt < retryDelays.length; attempt++) {
+      if (retryDelays[attempt] > Duration.zero) {
+        await Future.delayed(retryDelays[attempt]);
+      }
       if (!mounted || reqId != _scheduleRequestId) return;
 
-      if (resp.statusCode == 404) {
+      try {
+        final uri = Uri.parse(
+          '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}',
+        );
+        final resp = await http.get(uri).timeout(const Duration(seconds: 65));
+
+        if (!mounted || reqId != _scheduleRequestId) return;
+
+        if (resp.statusCode == 503 && attempt < retryDelays.length - 1) {
+          continue;
+        }
+
+        if (resp.statusCode == 404) {
+          if (attempt < retryDelays.length - 1) {
+            continue;
+          }
+          if (cached.isNotEmpty) {
+            setState(() {
+              _lessons = cached;
+              _selectedDate ??= _pickInitialDate(cached);
+              _loading = false;
+              _offlineBanner = true;
+              _error = null;
+            });
+          } else {
+            setState(() {
+              _lessons = [];
+              _selectedDate = _formatDateDdMmYyyy(DateTime.now());
+              _loading = false;
+              _offlineBanner = false;
+              _error =
+                  'Для групи "$targetGroup" розклад наразі відсутній на сервері (HTTP 404). Оберіть іншу групу у верхньому списку.';
+            });
+          }
+          return;
+        }
+
+        if (resp.statusCode != 200) {
+          throw Exception('HTTP ${resp.statusCode}');
+        }
+
+        final data = jsonDecode(resp.body) as Map<String, dynamic>;
+        final items = (data['items'] as List<dynamic>? ?? [])
+            .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
+            .toList();
+
+        await sp.setString(
+          _scheduleCacheKey(targetGroup),
+          jsonEncode(items.map((e) => e.toJson()).toList()),
+        );
+
+        if (!mounted || reqId != _scheduleRequestId) return;
+        final availableDates = _sortedDates(items, fromTodayOnly: false);
         setState(() {
-          _lessons = [];
-          _selectedDate = _formatDateDdMmYyyy(DateTime.now());
+          _lessons = items;
+          _selectedDate = (_selectedDate != null &&
+                  availableDates.contains(_selectedDate))
+              ? _selectedDate
+              : _pickInitialDate(items);
           _loading = false;
           _offlineBanner = false;
-          _error =
-              'Для групи "$targetGroup" розклад наразі відсутній на сервері (HTTP 404). Оберіть іншу групу у верхньому списку.';
+          _error = items.isEmpty
+              ? 'Сервер повернув порожній розклад для групи "$targetGroup".'
+              : null;
         });
         return;
-      }
-
-      if (resp.statusCode != 200) {
-        throw Exception('HTTP ${resp.statusCode}');
-      }
-
-      final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      final items = (data['items'] as List<dynamic>? ?? [])
-          .map((e) => LessonModel.fromJson(e as Map<String, dynamic>))
-          .toList();
-
-      await sp.setString(
-        _scheduleCacheKey(targetGroup),
-        jsonEncode(items.map((e) => e.toJson()).toList()),
-      );
-
-      if (!mounted || reqId != _scheduleRequestId) return;
-      final availableDates = _sortedDates(items, fromTodayOnly: false);
-      setState(() {
-        _lessons = items;
-        _selectedDate = (_selectedDate != null &&
-                availableDates.contains(_selectedDate))
-            ? _selectedDate
-            : _pickInitialDate(items);
-        _loading = false;
-        _offlineBanner = false;
-        _error = items.isEmpty
-            ? 'Сервер повернув порожній розклад для групи "$targetGroup".'
-            : null;
-      });
-    } catch (e) {
-      if (!mounted || reqId != _scheduleRequestId) return;
-      if (cached.isNotEmpty) {
-        setState(() {
-          _lessons = cached;
-          _selectedDate ??= _pickInitialDate(cached);
-          _loading = false;
-          _offlineBanner = true;
-          _error = null;
-        });
-      } else {
-        setState(() {
-          _loading = false;
-          _offlineBanner = true;
-          _error = 'Немає зв’язку і кешу для групи $targetGroup: $e';
-        });
+      } catch (e) {
+        if (!mounted || reqId != _scheduleRequestId) return;
+        if (attempt < retryDelays.length - 1) {
+          continue;
+        }
+        if (cached.isNotEmpty) {
+          setState(() {
+            _lessons = cached;
+            _selectedDate ??= _pickInitialDate(cached);
+            _loading = false;
+            _offlineBanner = true;
+            _error = null;
+          });
+        } else {
+          setState(() {
+            _loading = false;
+            _offlineBanner = true;
+            _error = 'Немає зв’язку і кешу для групи $targetGroup: $e';
+          });
+        }
       }
     }
   }
@@ -705,7 +739,14 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     }
 
     final text = _formatDayForTelegram(dateStr, dayLessons);
-    await Share.share(text);
+    try {
+      await Share.share(text);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не вдалося відкрити меню надсилання: $e')),
+      );
+    }
   }
 
   Future<void> _showZoomDialog(LessonModel lesson) async {
