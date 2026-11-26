@@ -41,15 +41,14 @@ jobs:
             ~/.gradle/wrapper
             ukrduzt_app/.dart_tool
             ukrduzt_app/build
-          key: ${{ runner.os }}-gradle-pub-${{ hashFiles('flutter/**', '**/pubspec.yaml') }}
+          key: ${{ runner.os }}-gradle-pub-v2-${{ hashFiles('.github/workflows/build-apk.yml', 'flutter/**', '**/pubspec.yaml') }}
           restore-keys: |
-            ${{ runner.os }}-gradle-pub-
+            ${{ runner.os }}-gradle-pub-v2-
 
       - name: Create Flutter project and copy app files
         run: |
           set -e
           flutter create --org ua.edu.kart.schedule ukrduzt_app
-          (cd ukrduzt_app && flutter pub add share_plus)
           rm -rf ukrduzt_app/test/*
           rm -rf ukrduzt_app/lib/*
           cp -r flutter/. ukrduzt_app/lib/
@@ -81,12 +80,16 @@ jobs:
               snippet = snippet_path.read_text(encoding="utf-8")
               for line in snippet.splitlines():
                   stripped = line.strip()
-                  if not stripped or stripped.startswith("dependencies:") or stripped.startswith("flutter:"):
-                      continue
-                  if stripped.startswith("sdk:"):
+                  if (
+                      not stripped
+                      or stripped.startswith("#")
+                      or stripped.startswith("dependencies:")
+                      or stripped.startswith("flutter:")
+                      or stripped.startswith("sdk:")
+                  ):
                       continue
                   if line.startswith("  "):
-                      deps.append(line.rstrip("\n"))
+                      deps.append(line.rstrip("\r\n"))
 
           if not any(d.split(":", 1)[0].strip() == "share_plus" for d in deps):
               deps.append("  share_plus: ^10.1.4")
@@ -239,13 +242,16 @@ jobs:
       - name: Install packages, analyze and test
         working-directory: ukrduzt_app
         run: |
+          set -e
           flutter pub get
           flutter analyze --no-fatal-infos
           flutter test
 
       - name: Build release APK (split per ABI)
         working-directory: ukrduzt_app
-        run: flutter build apk --release --split-per-abi
+        run: |
+          set -e
+          flutter build apk --release --split-per-abi
 
       - name: Rename APKs with commit SHA
         working-directory: ukrduzt_app
