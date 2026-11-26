@@ -5,13 +5,10 @@ on:
   push:
     branches: [ main ]
 
-# Cancel a previous run of the same branch when a new push lands — saves CI
-# minutes and avoids publishing a stale APK.
 concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
 
-# The workflow only needs to read the source; it never pushes back to the repo.
 permissions:
   contents: read
 
@@ -25,7 +22,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -33,7 +30,6 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          # Pinned version for reproducible builds. Bump intentionally.
           flutter-version: '3.24.5'
           cache: true
 
@@ -58,13 +54,13 @@ jobs:
 
       - name: Configure pubspec.yaml
         run: |
-          python3 -c '
+          python3 - <<'PY'
           from pathlib import Path
+
           pubspec = Path("ukrduzt_app/pubspec.yaml")
           snippet = Path("flutter/pubspec_dependencies_snippet.txt").read_text(encoding="utf-8")
           text = pubspec.read_text(encoding="utf-8")
-          # Pull only the real third-party deps from the snippet: lines that are
-          # indented ("  name: ...") and are NOT the Flutter SDK entry.
+
           deps = []
           for line in snippet.splitlines():
               stripped = line.strip()
@@ -74,66 +70,83 @@ jobs:
                   continue
               if line.startswith("  "):
                   deps.append(line.rstrip("\n"))
+
           anchor = "  cupertino_icons: ^1.0.8\n"
           insert_after = anchor if anchor in text else "dependencies:\n"
           for line in deps:
-              name = line.strip().split(":", 1)[0].strip()
-              marker = f"  {name}:"
-              if marker in text:
+              name = line.split(":", 1)[0].strip()
+              if f"  {name}:" in text:
                   continue
               text = text.replace(insert_after, insert_after + line + "\n", 1)
               insert_after = line + "\n"
+
           pubspec.write_text(text, encoding="utf-8")
-          '
+          PY
 
       - name: Ensure INTERNET permission in AndroidManifest.xml
         run: |
-          python3 -c '
+          python3 - <<'PY'
           import re
           from pathlib import Path
-          p = Path("ukrduzt_app/android/app/src/main/AndroidManifest.xml")
-          text = p.read_text(encoding="utf-8")
+
+          manifest = Path("ukrduzt_app/android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          perm = '    <uses-permission android:name="android.permission.INTERNET" />\n'
+
           if "android.permission.INTERNET" not in text:
-              perm = "    <uses-permission android:name=\"android.permission.INTERNET\" />\n"
               if re.search(r"<manifest\b[^>]*>\s*\n", text):
                   text = re.sub(r"(<manifest\b[^>]*>\s*\n)", r"\1" + perm, text, count=1)
               else:
                   text = re.sub(r"(<application\b)", perm + r"\1", text, count=1)
-          p.write_text(text, encoding="utf-8")
-          '
 
-      - name: Decode signing keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+          manifest.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Decode signing keystore and configure Gradle
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          set -e
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "ANDROID_KEYSTORE_BASE64 is empty; building with default signing config."
+            exit 0
+          fi
+
           mkdir -p ukrduzt_app/android/app
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ukrduzt_app/android/app/keystore.jks
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > ukrduzt_app/android/app/keystore.jks
+
           cat > ukrduzt_app/android/key.properties <<EOF
           storeFile=app/keystore.jks
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
           EOF
 
-      - name: Configure Gradle signing
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
-        working-directory: ukrduzt_app
-        run: |
-          python3 -c '
+          python3 - <<'PY'
           from pathlib import Path
           import re
-          gradle = Path("android/app/build.gradle")
-          text = gradle.read_text(encoding="utf-8")
-          if "keystoreProperties" not in text:
-              block = """
+
+          app_dir = Path("ukrduzt_app/android/app")
+          gradle_groovy = app_dir / "build.gradle"
+          gradle_kts = app_dir / "build.gradle.kts"
+
+          if gradle_groovy.exists():
+              text = gradle_groovy.read_text(encoding="utf-8")
+              if "keystoreProperties" not in text:
+                  props_block = """
           def keystoreProperties = new Properties()
           def keystorePropertiesFile = rootProject.file("key.properties")
           if (keystorePropertiesFile.exists()) {
               keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
           }
           """
-              text = re.sub(r"(android\s*\{)", block + r"\1", text, count=1)
-          if "signingConfigs" not in text:
-              sc = """
+                  text = re.sub(r"(android\s*\{)", props_block + r"\1", text, count=1)
+
+              if "signingConfigs" not in text:
+                  sc_block = """
               signingConfigs {
                   release {
                       keyAlias keystoreProperties["keyAlias"]
@@ -143,23 +156,64 @@ jobs:
                   }
               }
           """
-              text = re.sub(r"(buildTypes\s*\{)", sc + r"\1", text, count=1)
-          if "signingConfig signingConfigs.release" not in text:
-              text = re.sub(
-                  r"(release\s*\{[^}]*?)(\s*\})",
-                  r"\1            signingConfig signingConfigs.release\2",
-                  text,
-                  count=1,
-                  flags=re.DOTALL,
-              )
-          gradle.write_text(text, encoding="utf-8")
-          '
+                  text = re.sub(r"(buildTypes\s*\{)", sc_block + r"\1", text, count=1)
+
+              if "signingConfig signingConfigs.release" not in text:
+                  text = re.sub(
+                      r"(release\s*\{[^}]*?)(\s*\})",
+                      r"\1            signingConfig signingConfigs.release\2",
+                      text,
+                      count=1,
+                      flags=re.DOTALL,
+                  )
+
+              gradle_groovy.write_text(text, encoding="utf-8")
+
+          elif gradle_kts.exists():
+              text = gradle_kts.read_text(encoding="utf-8")
+              if "keystoreProperties" not in text:
+                  import_line = "import java.util.Properties\nimport java.io.FileInputStream\n\n"
+                  props_block = """
+          val keystoreProperties = Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+          }
+          """
+                  text = import_line + re.sub(r"(android\s*\{)", props_block + r"\1", text, count=1)
+
+              if "signingConfigs" not in text:
+                  sc_block = """
+              signingConfigs {
+                  create("release") {
+                      keyAlias = keystoreProperties.getProperty("keyAlias")
+                      keyPassword = keystoreProperties.getProperty("keyPassword")
+                      val storeFilePath = keystoreProperties.getProperty("storeFile")
+                      storeFile = if (!storeFilePath.isNullOrBlank()) file(storeFilePath) else null
+                      storePassword = keystoreProperties.getProperty("storePassword")
+                  }
+              }
+          """
+                  text = re.sub(r"(buildTypes\s*\{)", sc_block + r"\1", text, count=1)
+
+              if 'signingConfig = signingConfigs.getByName("release")' not in text:
+                  text = re.sub(
+                      r'(getByName\("release"\)\s*\{[^}]*?)(\s*\})',
+                      r'\1            signingConfig = signingConfigs.getByName("release")\2',
+                      text,
+                      count=1,
+                      flags=re.DOTALL,
+                  )
+
+              gradle_kts.write_text(text, encoding="utf-8")
+          else:
+              raise FileNotFoundError("Neither build.gradle nor build.gradle.kts found in android/app")
+          PY
 
       - name: Install packages, analyze and test
         working-directory: ukrduzt_app
         run: |
           flutter pub get
-          # Warnings must break the build — otherwise they are silently ignored.
           flutter analyze --no-fatal-infos
           flutter test
 
