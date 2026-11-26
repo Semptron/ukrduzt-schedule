@@ -49,6 +49,7 @@ jobs:
         run: |
           set -e
           flutter create --org ua.edu.kart.schedule ukrduzt_app
+          (cd ukrduzt_app && flutter pub add share_plus)
           rm -rf ukrduzt_app/test/*
           rm -rf ukrduzt_app/lib/*
           cp -r flutter/. ukrduzt_app/lib/
@@ -72,21 +73,23 @@ jobs:
 
           pubspec = Path("ukrduzt_app/pubspec.yaml")
           snippet_path = Path("flutter/pubspec_dependencies_snippet.txt")
-          if not snippet_path.exists():
-              raise SystemExit(0)
 
           text = pubspec.read_text(encoding="utf-8")
-          snippet = snippet_path.read_text(encoding="utf-8")
-
           deps = []
-          for line in snippet.splitlines():
-              stripped = line.strip()
-              if not stripped or stripped.startswith("dependencies:") or stripped.startswith("flutter:"):
-                  continue
-              if stripped.startswith("sdk:"):
-                  continue
-              if line.startswith("  "):
-                  deps.append(line.rstrip("\n"))
+
+          if snippet_path.exists():
+              snippet = snippet_path.read_text(encoding="utf-8")
+              for line in snippet.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("dependencies:") or stripped.startswith("flutter:"):
+                      continue
+                  if stripped.startswith("sdk:"):
+                      continue
+                  if line.startswith("  "):
+                      deps.append(line.rstrip("\n"))
+
+          if not any(d.split(":", 1)[0].strip() == "share_plus" for d in deps):
+              deps.append("  share_plus: ^10.1.4")
 
           anchor = "  cupertino_icons: ^1.0.8\n"
           insert_after = anchor if anchor in text else "dependencies:\n"
