@@ -13,6 +13,8 @@ GROUP_RE = re.compile(
 DATE_RE = re.compile(r"\b\d{1,2}\.\d{2}\.\d{4}\b")
 NUMERIC_DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{2})\.(\d{4})\b")
 SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\.\d|\d)")
+# pdfplumber sometimes extracts dates right-to-left: 6202.11.42 → 24.11.2026
+REVERSED_DATE_RE = re.compile(r"\b(\d{4})\.(\d{2})\.(\d{2})\b")
 LESSON_NUM_RE = re.compile(r"^[1-8]$")
 LESSON_TYPE_RE = re.compile(
     r"\b(лк|пр|лаб|лік|лек|інд\.?\s*конс\.?|конс\.?|лекц\w*|практ\w*|лаб\w*)\b\.?",
@@ -36,7 +38,9 @@ ZOOM_PASS_RE = re.compile(
 SUBJECT_QUOTES_RE = re.compile(r'[«"]([^»"]+)[»"]')
 
 WEEKDAY_RE = re.compile(
-    r"^(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)$",
+    r"^(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя|"
+    # pdfplumber sometimes reverses weekday text character-by-character
+    r"коніделоп|коротвіВ|адереС|ревтеЧ|яцинтя.П|атобуС|ялідеН)$",
     re.IGNORECASE,
 )
 HEADER_NOISE_RE = re.compile(
@@ -173,12 +177,49 @@ class ParseWarning:
     raw: str
 
 
+def _normalize_lesson_type(raw: str | None) -> str | None:
+    """Canonicalize lesson type strings from OCR/regex captures."""
+    if not raw:
+        return None
+    t = re.sub(r"\s+", " ", raw).strip().lower()
+    # Individual consultation variants → "інд. конс."
+    if re.match(r"^інд\.?\s*конс", t) or re.match(r"^індив", t):
+        return "інд. конс."
+    # Short forms
+    mapping = {
+        "лк": "лк",
+        "лек": "лк",
+        "лекц": "лк",
+        "лекція": "лк",
+        "пр": "пр",
+        "практ": "пр",
+        "практична": "пр",
+        "лаб": "лаб",
+        "лабор": "лаб",
+        "лабораторна": "лаб",
+        "лік": "лік",
+        "конс": "конс.",
+        "конс.": "конс.",
+        "консультація": "конс.",
+    }
+    for key, val in mapping.items():
+        if t == key or t.startswith(key):
+            return val
+    # Keep trailing period for short abbreviations that usually have it
+    if t in ("конс", "екз", "экз") and not t.endswith("."):
+        return t + "."
+    return t
+
+
 def clean_cell(text: str | None) -> str:
     if not text:
         return ""
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line and line != "|"]
-    return " ".join(lines).strip()
+    joined = " ".join(lines).strip()
+    # Remove standalone pipe separators left from table OCR
+    joined = re.sub(r"\s*\|\s*", " ", joined)
+    return re.sub(r"\s+", " ", joined).strip()
 
 
 def _split_cell_lines(text: str | None) -> list[str]:
@@ -220,46 +261,31 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
         r"\1. \2.",
         cleaned,
     )
-    cleaned = re.sub(
-        r"([А-ЯІЇЄҐA-Z])\.?\s+([А-ЯІЇЄҐA-Z])\.?$",
-        r"\1. \2.",
-        cleaned,
-    )
-    cleaned = re.sub(r"\.\.+", ".", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;|")
 
-    if cleaned.lower() in TEACHER_EXACT_NOISE or len(cleaned) < 4 or cleaned.isdigit():
+    lower = cleaned.lower()
+    if lower in TEACHER_EXACT_NOISE:
         return None
-
-    if any(ch.isdigit() for ch in cleaned):
+    if any(sw in lower for sw in TEACHER_STOPWORDS) and not SURNAME_WITH_INITIALS_RE.match(
+        cleaned
+    ):
         return None
-
-    words = cleaned.split()
-    if len(words) > 4:
+    if MIXED_SCRIPT_WORD_RE.match(cleaned) or WEIRD_CASE_WORD_RE.match(cleaned):
         return None
-
-    for w in words:
-        w_clean = w.strip(".,;:-")
-        if not w_clean:
-            continue
-        if len(w_clean) == 1 and w.endswith("."):
-            continue
-        if MIXED_SCRIPT_WORD_RE.match(w_clean) or WEIRD_CASE_WORD_RE.match(w_clean):
+    if not (
+        SURNAME_WITH_INITIALS_RE.match(cleaned)
+        or FULL_NAME_RE.match(cleaned)
+        or re.match(r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.", cleaned)
+    ):
+        if len(cleaned) < 4:
             return None
-        if w_clean.lower() in TEACHER_STOPWORDS:
-            return None
-
-    if SURNAME_WITH_INITIALS_RE.match(cleaned):
-        return cleaned
-
-    if FULL_NAME_RE.match(cleaned):
-        return cleaned
-
-    return None
+    return cleaned
 
 
 def detect_lesson_number(row: list[str | None], fallback_counter: int) -> int:
     for cell in row:
+        if cell is None:
+            continue
         txt = clean_cell(cell)
         if LESSON_NUM_RE.match(txt):
             return int(txt)
@@ -282,7 +308,8 @@ def _normalize_date_parts(day: str, month: str, year: str) -> str | None:
 
 def _extract_year_from_filename(pdf_path: str) -> str | None:
     name = Path(pdf_path).name
-    full_years = re.findall(r"\b(202[4-9]|203\d)\b", name)
+    # Prefer explicit 4-digit years, including ranges like 24.11-02.12.2026
+    full_years = re.findall(r"(?<!\d)(202[4-9]|203\d)(?!\d)", name)
     if full_years:
         return full_years[-1]
     short_range = re.search(r"\b(2[4-9])-(2[5-9]|30)\b", name)
@@ -312,6 +339,21 @@ def _extract_full_dates_from_text(line: str) -> list[str]:
     for m in NUMERIC_DATE_RE.finditer(line):
         d, m_num, y = m.groups()
         norm = _normalize_date_parts(d, m_num, y)
+        if norm:
+            tokens.append((m.start(), norm))
+    # Reversed OCR/extraction order: YYYY.MM.DD written backwards as digits
+    # e.g. "6202.11.42" is visual "24.11.2026"
+    for m in REVERSED_DATE_RE.finditer(line):
+        y_rev, m_rev, d_rev = m.groups()
+        # Only treat as reversed when year part looks like a reversed 202x
+        if y_rev.startswith("20") and 2020 <= int(y_rev) <= 2035:
+            # Already a normal-looking YYYY.MM.DD — skip (handled above if needed)
+            continue
+        # Digit-reverse each component: 6202→2026, 11→11, 42→24
+        y = y_rev[::-1]
+        mo = m_rev[::-1]
+        d = d_rev[::-1]
+        norm = _normalize_date_parts(d, mo, y)
         if norm:
             tokens.append((m.start(), norm))
     tokens.sort(key=lambda t: t[0])
@@ -349,9 +391,14 @@ def _is_date_header_line(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
-    if DATE_RE.fullmatch(s) or TEXT_DATE_RE.fullmatch(s):
+    if DATE_RE.fullmatch(s) or TEXT_DATE_RE.fullmatch(s) or REVERSED_DATE_RE.fullmatch(s):
+        return True
+    if _extract_full_dates_from_text(s) and WEEKDAY_RE.fullmatch(
+        re.sub(r"[\d.\s,.;:|()-–]+", "", s)
+    ):
         return True
     stripped = re.sub(r"\b\d{1,2}\.\d{2}\.\d{4}\b", "", s)
+    stripped = re.sub(r"\b\d{4}\.\d{2}\.\d{2}\b", "", stripped)
     stripped = TEXT_DATE_RE.sub("", stripped)
     stripped = WEEKDAY_RE.sub("", stripped.strip())
     stripped = re.sub(r"[\s,.;:|()-–]+", "", stripped)
@@ -360,8 +407,11 @@ def _is_date_header_line(line: str) -> bool:
 
 def _strip_leading_date_or_weekday(text: str) -> str:
     s = re.sub(r"^\s*\d{1,2}\.\d{2}\.\d{4}\s*[,.;:|()-–]*\s*", "", text)
+    s = re.sub(r"^\s*\d{4}\.\d{2}\.\d{2}\s*[,.;:|()-–]*\s*", "", s)
     s = re.sub(
-        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя)\s*[,.;:|()-–]*\s*",
+        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя|"
+        r"коніделоп|коротвіВ|адереС|ревтеЧ|яцинтя.П|атобуС|ялідеН)"
+        r"\s*[,.;:|()-–]*\s*",
         "",
         s,
         flags=re.IGNORECASE,
@@ -381,17 +431,18 @@ def _split_text_by_dates(text: str, active_date: str) -> list[tuple[str, str]]:
         if prefix:
             segments.append((active_date, prefix))
 
-    for idx, m in enumerate(matches):
+    for i, m in enumerate(matches):
         raw_tok = m.group(0)
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[m.end() : end].strip()
         parsed_dates = _extract_full_dates_from_text(raw_tok)
         seg_date = parsed_dates[0] if parsed_dates else active_date
-        start_pos = m.end()
-        end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        body = text[start_pos:end_pos].strip(" ,.;:|()-–")
         if body:
             segments.append((seg_date, body))
+        elif not segments:
+            segments.append((seg_date, ""))
 
-    return segments
+    return segments if segments else [(active_date, text)]
 
 
 def _extract_groups_from_text(text: str) -> list[str]:
@@ -420,31 +471,27 @@ def _looks_like_lesson_line(line: str) -> bool:
         LESSON_TYPE_RE.search(line)
         or ROOM_RE.search(line)
         or "," in line
+        or SUBJECT_QUOTES_RE.search(line)
+        or URL_RE.search(line)
     )
 
 
-def _extract_subject_and_teacher(parts: list[str], cleaned: str) -> tuple[str, str | None]:
+def _extract_subject_and_teacher(
+    parts: list[str], cleaned: str
+) -> tuple[str, str | None]:
     teacher: str | None = None
-    teacher_idx: int | None = None
-
-    for idx in range(len(parts) - 1, -1, -1):
-        cand = parts[idx].strip()
-        norm = normalize_teacher_name(cand)
-        if norm:
-            teacher = norm
-            teacher_idx = idx
-            break
-
-    if not teacher:
-        teacher = normalize_teacher_name(cleaned)
-
     subject_parts: list[str] = []
-    limit = teacher_idx if teacher_idx is not None else len(parts)
-    for part in parts[:limit]:
-        p = part.strip()
-        if not p:
-            continue
+
+    for p in parts:
         if ROOM_RE.fullmatch(p) or LESSON_TYPE_RE.fullmatch(p) or FRAGMENT_NOISE_RE.match(p):
+            continue
+        if _is_date_header_line(p):
+            continue
+        cand = normalize_teacher_name(p)
+        if cand and not teacher:
+            teacher = cand
+            continue
+        if GARBAGE_SUBJECT_RE.match(p):
             continue
         subject_parts.append(p)
 
@@ -482,7 +529,9 @@ def parse_cell_to_lesson(
     zoom_match = ZOOM_RE.search(cleaned)
     any_url_match = URL_RE.search(cleaned)
 
-    lesson_type = re.sub(r"\s+", " ", type_match.group(1)).lower() if type_match else None
+    lesson_type = (
+        _normalize_lesson_type(type_match.group(1)) if type_match else None
+    )
     room = room_match.group(0) if room_match else None
     meeting_url = (
         zoom_match.group(0)
@@ -538,6 +587,7 @@ def _extract_tables_from_page(page) -> list:
             "horizontal_strategy": "text",
             "snap_tolerance": 4,
             "join_tolerance": 4,
+            "edge_min_length": 20,
         }
     )
 
@@ -545,33 +595,40 @@ def _extract_tables_from_page(page) -> list:
 def _collect_page_date_anchors(page, fallback_year: str | None) -> list[tuple[float, float, float, str]]:
     """Collects (top, x0, x1, date_str) anchors on a page using word/line coordinates."""
     anchors: list[tuple[float, float, float, str]] = []
-    words = page.extract_words() or []
+    try:
+        words = page.extract_words() or []
+    except Exception:
+        words = []
     for w in words:
         txt = (w.get("text") or "").strip()
-        if not txt:
-            continue
         dates = _extract_dates_from_text(txt, fallback_year=fallback_year, allow_short=False)
         for d in dates:
             anchors.append(
                 (
-                    float(w.get("top", 0.0)),
-                    float(w.get("x0", 0.0)),
-                    float(w.get("x1", 0.0)),
+                    float(w.get("top", 0)),
+                    float(w.get("x0", 0)),
+                    float(w.get("x1", 0)),
+                    d,
+                )
+            )
+    try:
+        lines = page.extract_text_lines() or []
+    except Exception:
+        lines = []
+    for ln in lines:
+        txt = (ln.get("text") or "").strip()
+        dates = _extract_dates_from_text(txt, fallback_year=fallback_year, allow_short=True)
+        for d in dates:
+            anchors.append(
+                (
+                    float(ln.get("top", 0)),
+                    float(ln.get("x0", 0)),
+                    float(ln.get("x1", 0)),
                     d,
                 )
             )
     anchors.sort(key=lambda a: (a[0], a[1]))
-    deduped: list[tuple[float, float, float, str]] = []
-    for top_v, x0_v, x1_v, d_str in anchors:
-        if any(
-            abs(top_v - p_top) <= 3.0
-            and abs(x0_v - p_x0) <= 12.0
-            and d_str == p_d
-            for p_top, p_x0, _, p_d in deduped
-        ):
-            continue
-        deduped.append((top_v, x0_v, x1_v, d_str))
-    return deduped
+    return anchors
 
 
 def _resolve_date_by_position(
@@ -584,132 +641,105 @@ def _resolve_date_by_position(
     """Finds the most recent date anchor above `item_top` (preferring same/left column)."""
     if not anchors:
         return fallback_date
-
-    above = [a for a in anchors if a[0] <= item_top + 2.0]
+    above = [a for a in anchors if a[0] <= item_top + 2]
     if not above:
         return fallback_date
 
-    # Prefer anchors that overlap horizontally or lie to the left of the item
+    mid_x = (item_x0 + item_x1) / 2
     col_candidates = [
-        a for a in above if (a[1] <= item_x1 + 20.0 and a[2] >= item_x0 - 20.0) or a[1] <= item_x0 + 10.0
+        a
+        for a in above
+        if a[1] - 30 <= mid_x <= a[2] + 30 or a[1] <= item_x0 <= a[2] or item_x0 <= a[1] <= item_x1
     ]
     pool = col_candidates if col_candidates else above
-    pool.sort(key=lambda a: (a[0], -abs(a[1] - item_x0)))
-    return pool[-1][3]
+    # Closest above
+    best = max(pool, key=lambda a: a[0])
+    return best[3]
 
 
 def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
-    pages_lines: list[tuple[list[str], list[str]]] = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            lines = [
-                re.sub(r"\s+", " ", line).strip()
-                for line in txt.splitlines()
-                if re.sub(r"\s+", " ", line).strip()
-            ]
-            p_groups = _extract_groups_from_text("\n".join(lines))
-            if lines:
-                pages_lines.append((lines, p_groups))
-
-    if not pages_lines:
-        return []
-
-    joined = "\n".join(line for lines, _ in pages_lines for line in lines)
-    subj_match = SUBJECT_QUOTES_RE.search(joined)
-    default_subject = subj_match.group(1).strip() if subj_match else "Заняття"
-    default_type = (
-        "консультація"
-        if ("консультатив" in joined.lower() or "конс" in joined.lower())
-        else "заняття"
-    )
-
-    zoom_id_match = ZOOM_ID_RE.search(joined)
-    zoom_pass_match = ZOOM_PASS_RE.search(joined)
-    meeting_code = (
-        re.sub(r"\s+", " ", zoom_id_match.group(1)).strip()
-        if zoom_id_match
-        else None
-    )
-    meeting_password = zoom_pass_match.group(1).strip() if zoom_pass_match else None
-
-    fallback_year = _extract_year_from_filename(pdf_path)
-    if not fallback_year:
-        years_in_text = re.findall(r"\b(202[4-9]|203\d)\b", joined)
-        fallback_year = years_in_text[-1] if years_in_text else str(datetime.now().year)
-
-    current_teacher: str | None = None
-    current_date: str | None = None
-    lesson_counter = 0
     items: list[LessonItem] = []
     warnings: list[ParseWarning] = []
+    fallback_year = _extract_year_from_filename(pdf_path)
 
-    for full_lines, page_groups in pages_lines:
-        active_page_groups = page_groups or ["Загальний потік"]
+    with pdfplumber.open(pdf_path) as pdf:
+        full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+        if not fallback_year:
+            years_in_text = re.findall(r"\b(202[4-9]|203\d)\b", full_text)
+            fallback_year = years_in_text[-1] if years_in_text else str(datetime.now().year)
 
-        for i, line in enumerate(full_lines):
-            if "проводить" in line.lower() and i + 1 < len(full_lines):
-                next_line = full_lines[i + 1]
-                if not any(
-                    k in next_line.lower()
-                    for k in ("ідентифікатор", "код доступу", "курс", "пара")
-                ):
-                    current_teacher = normalize_teacher_name(next_line)
+    current_date: str | None = None
+    current_teacher: str | None = None
+    meeting_code: str | None = None
+    meeting_password: str | None = None
+    lesson_counter = 0
 
-            if _is_date_header_line(line):
-                dates = _extract_dates_from_text(
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_txt = page.extract_text() or ""
+            lines = [clean_cell(ln) for ln in page_txt.splitlines()]
+            lines = [ln for ln in lines if ln]
+            page_groups = _extract_groups_from_text("\n".join(lines))
+            active_page_groups = page_groups or ["Загальний потік"]
+            full_lines = lines
+
+            for i, line in enumerate(full_lines):
+                if _is_date_header_line(line):
+                    dates = _extract_dates_from_text(
+                        line, fallback_year=fallback_year, allow_short=True
+                    )
+                    if dates:
+                        current_date = dates[0]
+                        lesson_counter = 0
+                    continue
+
+                id_m = ZOOM_ID_RE.search(line)
+                if id_m:
+                    meeting_code = re.sub(r"\s+", "", id_m.group(1))
+                pass_m = ZOOM_PASS_RE.search(line)
+                if pass_m:
+                    meeting_password = pass_m.group(1).strip()
+
+                line_groups = _extract_groups_from_text(line)
+                target_groups = line_groups if line_groups else active_page_groups
+
+                line_dates = _extract_dates_from_text(
                     line, fallback_year=fallback_year, allow_short=True
                 )
-                if dates:
-                    current_date = dates[0]
+                pair_match = PAIR_RE.search(line)
+                if line_dates and pair_match:
+                    current_date = line_dates[-1]
                     lesson_counter = 0
-                continue
 
-            line_groups = _extract_groups_from_text(line)
-            target_groups = line_groups if line_groups else active_page_groups
+                if current_date and line_dates and not pair_match:
+                    for d_str in line_dates:
+                        if d_str != current_date:
+                            current_date = d_str
+                            lesson_counter = 0
+                            break
 
-            pair_match = PAIR_RE.search(line)
-            line_dates = _extract_dates_from_text(
-                line, fallback_year=fallback_year, allow_short=False
-            )
-            if line_dates and pair_match:
-                current_date = line_dates[-1]
-                pair_nums: list[int] = []
-                for grp_idx in (1, 2, 3):
-                    val = pair_match.group(grp_idx)
-                    if val and val.isdigit():
-                        p = int(val)
-                        if p not in pair_nums:
-                            pair_nums.append(p)
-
-                for d_str in line_dates:
-                    for p_num in pair_nums:
-                        start, end = BELLS.get(p_num, ("00:00", "00:00"))
+                if current_date and LESSON_NUM_RE.match(line) and i + 1 < len(full_lines):
+                    p_num = int(line)
+                    next_line = full_lines[i + 1]
+                    if not _is_date_header_line(next_line):
                         for g_name in target_groups:
-                            items.append(
-                                LessonItem(
-                                    date=d_str,
-                                    group=g_name,
-                                    lesson_number=p_num,
-                                    time_start=start,
-                                    time_end=end,
-                                    subject=default_subject,
-                                    room=None,
-                                    lesson_type=default_type,
-                                    teacher=current_teacher,
-                                    meeting_url=None,
-                                    meeting_code=meeting_code,
-                                    meeting_password=meeting_password,
-                                    raw=line,
-                                )
+                            parsed = parse_cell_to_lesson(
+                                current_date, g_name, p_num, next_line, warnings
                             )
-            elif current_date and LESSON_NUM_RE.match(line) and i + 1 < len(full_lines):
-                p_num = int(line)
-                next_line = full_lines[i + 1]
-                if not _is_date_header_line(next_line):
+                            if parsed:
+                                if not parsed.teacher and current_teacher:
+                                    parsed.teacher = current_teacher
+                                parsed.meeting_code = meeting_code
+                                parsed.meeting_password = meeting_password
+                                items.append(parsed)
+                    continue
+
+                elif current_date and _looks_like_lesson_line(line):
+                    lesson_counter += 1
+                    p_num = min(lesson_counter, 8)
                     for g_name in target_groups:
                         parsed = parse_cell_to_lesson(
-                            current_date, g_name, p_num, next_line, warnings
+                            current_date, g_name, p_num, line, warnings
                         )
                         if parsed:
                             if not parsed.teacher and current_teacher:
@@ -717,19 +747,6 @@ def _parse_text_fallback(pdf_path: str) -> list[LessonItem]:
                             parsed.meeting_code = meeting_code
                             parsed.meeting_password = meeting_password
                             items.append(parsed)
-            elif current_date and _looks_like_lesson_line(line):
-                lesson_counter += 1
-                p_num = min(lesson_counter, 8)
-                for g_name in target_groups:
-                    parsed = parse_cell_to_lesson(
-                        current_date, g_name, p_num, line, warnings
-                    )
-                    if parsed:
-                        if not parsed.teacher and current_teacher:
-                            parsed.teacher = current_teacher
-                        parsed.meeting_code = meeting_code
-                        parsed.meeting_password = meeting_password
-                        items.append(parsed)
 
     return items
 
@@ -761,9 +778,17 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
 
                 t_bbox = getattr(t_obj, "bbox", None)
                 t_top = float(t_bbox[1]) if t_bbox and len(t_bbox) >= 4 else 0.0
-                t_bottom = float(t_bbox[3]) if t_bbox and len(t_bbox) >= 4 else float(getattr(page, "height", 1000.0))
+                t_bottom = (
+                    float(t_bbox[3])
+                    if t_bbox and len(t_bbox) >= 4
+                    else float(getattr(page, "height", 1000.0))
+                )
                 t_x0 = float(t_bbox[0]) if t_bbox and len(t_bbox) >= 4 else 0.0
-                t_x1 = float(t_bbox[2]) if t_bbox and len(t_bbox) >= 4 else float(getattr(page, "width", 1000.0))
+                t_x1 = (
+                    float(t_bbox[2])
+                    if t_bbox and len(t_bbox) >= 4
+                    else float(getattr(page, "width", 1000.0))
+                )
                 num_rows = max(len(table), 1)
                 row_height = (t_bottom - t_top) / num_rows
 
@@ -777,9 +802,7 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
 
                     cleaned_cells = [clean_cell(c) for c in row]
                     non_empty_cells = [
-                        (idx, txt)
-                        for idx, txt in enumerate(cleaned_cells)
-                        if txt
+                        (idx, txt) for idx, txt in enumerate(cleaned_cells) if txt
                     ]
                     if not non_empty_cells:
                         continue
@@ -830,6 +853,10 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                             line_step = row_height / max(len(cell_lines), 1)
 
                             for line_i, c_line in enumerate(cell_lines):
+                                if not c_line or LESSON_NUM_RE.match(c_line):
+                                    continue
+                                if WEEKDAY_RE.match(c_line):
+                                    continue
                                 line_top = row_top + line_i * line_step
                                 pos_date = _resolve_date_by_position(
                                     date_anchors,
@@ -838,23 +865,22 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                                     cell_x1,
                                     base_fallback_date,
                                 )
-                                line_dates = _extract_full_dates_from_text(c_line)
-                                if line_dates:
-                                    pos_date = line_dates[-1]
-                                    current_date = pos_date
-                                    if _is_date_header_line(c_line):
-                                        continue
-
-                                for seg_date, seg_txt in _split_text_by_dates(c_line, pos_date):
+                                for seg_date, seg_txt in _split_text_by_dates(
+                                    c_line, pos_date
+                                ):
                                     item = parse_cell_to_lesson(
-                                        seg_date, group_name, lesson_num, seg_txt, warnings
+                                        seg_date,
+                                        group_name,
+                                        lesson_num,
+                                        seg_txt,
+                                        warnings,
                                     )
                                     if item:
                                         results.append(item)
                     else:
                         target_groups = page_groups or ["Загальний потік"]
                         for col_idx, cell_txt in non_empty_cells:
-                            if _is_date_header_line(cell_txt):
+                            if not cell_txt:
                                 continue
                             if LESSON_NUM_RE.match(cell_txt) or WEEKDAY_RE.match(
                                 cell_txt
@@ -871,7 +897,9 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                             )
                             cell_groups = _extract_groups_from_text(cell_txt)
                             groups_for_cell = cell_groups or target_groups
-                            for seg_date, seg_txt in _split_text_by_dates(cell_txt, pos_date):
+                            for seg_date, seg_txt in _split_text_by_dates(
+                                cell_txt, pos_date
+                            ):
                                 for g_name in groups_for_cell:
                                     item = parse_cell_to_lesson(
                                         seg_date, g_name, lesson_num, seg_txt, warnings
@@ -903,9 +931,16 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
 
 
 def _format_default_date(fallback_year: str | None) -> str:
-    now = datetime.now()
-    y = fallback_year or str(now.year)
-    return f"{now.day:02d}.{now.month:02d}.{y}"
+    """Last-resort date when nothing could be extracted from the PDF.
+
+    Prefer a neutral semester-start style date over "today", otherwise every
+    lesson without a detected header collapses to the same calendar day
+    (the day the sync ran).
+    """
+    y = fallback_year or str(datetime.now().year)
+    # Correspondence sessions typically start mid-November / early March
+    month = 11 if int(y) >= datetime.now().year else 3
+    return f"01.{month:02d}.{y}"
 
 
 def parse_schedule_pdf(pdf_path: str) -> list[dict]:
