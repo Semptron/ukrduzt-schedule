@@ -1,0 +1,28 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Python caches & venvs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+
+# Local runtime data — must NOT be baked into the image
+data/
+downloads/
+
+# Docs & dev-only files
+*.md
+LICENSE
+tests/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
