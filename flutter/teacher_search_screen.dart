@@ -24,17 +24,20 @@ bool _looksLikeTeacher(String name) {
 
 class TeacherSearchScreen extends StatefulWidget {
   final String apiBaseUrl;
+  final bool isActive;
 
   const TeacherSearchScreen({
     super.key,
     this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
+    this.isActive = true,
   });
 
   @override
   State<TeacherSearchScreen> createState() => _TeacherSearchScreenState();
 }
 
-class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
+class _TeacherSearchScreenState extends State<TeacherSearchScreen>
+    with WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   List<String> _allTeachers = [];
   List<LessonModel> _results = [];
@@ -47,13 +50,51 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadLocalZoomAndTeachers();
   }
 
   @override
+  void didUpdateWidget(covariant TeacherSearchScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // When the user switches back to this tab, re-read Zoom overrides that may
+    // have been added on the schedule tab meanwhile.
+    if (!oldWidget.isActive && widget.isActive) {
+      _refreshZoomConfigs();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(_) {
+    // App resumed from background — re-read Zoom overrides that the user may
+    // have added on the schedule tab while the app was backgrounded.
+    _refreshZoomConfigs();
+  }
+
+  Future<void> _refreshZoomConfigs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final rawMeetings = prefs.getString(kMeetingsPrefsKey);
+    Map<String, ZoomAccessConfig> next = {};
+    if (rawMeetings != null && rawMeetings.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawMeetings) as Map<String, dynamic>;
+        next = decoded.map(
+          (k, v) => MapEntry(
+            k,
+            ZoomAccessConfig.fromJson(v as Map<String, dynamic>),
+          ),
+        );
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() => _zoomConfigs = next);
   }
 
   List<LessonModel> _collectCachedLessons(SharedPreferences prefs) {
