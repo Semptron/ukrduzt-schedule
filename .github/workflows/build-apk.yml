@@ -251,7 +251,17 @@ jobs:
         working-directory: ukrduzt_app
         run: |
           set -e
-          flutter build apk --release --split-per-abi
+          attempt=1
+          max_attempts=3
+          until flutter build apk --release --split-per-abi; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "APK build failed after $max_attempts attempts"
+              exit 1
+            fi
+            echo "Attempt $attempt failed (possible Maven 429 rate limit), retrying in 15s..."
+            attempt=$((attempt + 1))
+            sleep 15
+          done
 
       - name: Rename APKs with commit SHA
         working-directory: ukrduzt_app
