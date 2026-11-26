@@ -6,6 +6,22 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'schedule_screen.dart';
 
+
+bool _looksLikeTeacher(String name) {
+  final t = name.trim();
+  if (t.length < 4 || t.length > 60) return false;
+  // room codes like 1.125б / 2.220б
+  if (RegExp(r'^\d+\.[\wА-Яа-яІіЇїЄєҐґ]+$').hasMatch(t)) return false;
+  if (t.toLowerCase().contains('http') || t.toLowerCase().contains('zoom')) {
+    return false;
+  }
+  if (RegExp(r'^[A-Za-z0-9+/=_-]{16,}$').hasMatch(t)) return false;
+  // must contain a Cyrillic letter (Ukrainian names)
+  if (!RegExp(r'[А-Яа-яІіЇїЄєҐґ]').hasMatch(t)) return false;
+  // prefer "Surname X." pattern
+  return RegExp(r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]+\s+[А-ЯІЇЄҐ]").hasMatch(t);
+}
+
 class TeacherSearchScreen extends StatefulWidget {
   final String apiBaseUrl;
 
@@ -81,7 +97,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
 
     if (mounted) {
       setState(() {
-        _allTeachers = localTeachers.toList()..sort();
+        _allTeachers = localTeachers.where(_looksLikeTeacher).toList()..sort();
         _loadingTeachers = false;
       });
     }
@@ -96,7 +112,8 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
             .where((e) => e.isNotEmpty)
             .toSet();
         apiTeachers.addAll(localTeachers);
-        setState(() => _allTeachers = apiTeachers.toList()..sort());
+        final filtered = apiTeachers.where(_looksLikeTeacher).toList()..sort();
+        setState(() => _allTeachers = filtered);
       }
     } catch (_) {}
   }
@@ -321,13 +338,15 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen> {
                               final item = _results[index];
                               final zoomCfg = _getZoomConfig(item);
                               final meta = <String>[
-                                'Група ${item.group}',
-                                '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
-                                if (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
-                                  item.lessonType!.trim(),
-                                if (item.teacher != null && item.teacher!.trim().isNotEmpty)
-                                  item.teacher!.trim(),
-                              ];
+                                  if (item.group.trim().isNotEmpty) 'Група ${item.group}',
+                                  '${item.lessonNumber} пара (${item.timeStart}–${item.timeEnd})',
+                                  if (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
+                                    item.lessonType!.trim(),
+                                  if (item.room != null && item.room!.trim().isNotEmpty)
+                                    item.room!.trim(),
+                                  if (displayTeacher(item.teacher) != null)
+                                    displayTeacher(item.teacher)!,
+                                ];
 
                               return Card(
                                 margin: const EdgeInsets.only(bottom: 10),
