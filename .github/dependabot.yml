@@ -1,0 +1,42 @@
+# Dependabot keeps the Python deps and GitHub Actions up to date.
+# Weekly cadence keeps PR noise low while catching security patches.
+
+version: 2
+updates:
+  # Python backend dependencies
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: deps(backend)
+      include: scope
+    groups:
+      fastapi-stack:
+        patterns:
+          - fastapi
+          - starlette
+          - uvicorn
+      testing:
+        patterns:
+          - pytest
+          - pytest-*
+
+  # GitHub Actions used in workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci(actions)
+      include: scope
