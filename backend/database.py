@@ -246,6 +246,16 @@ def query_lessons(
         clauses.append("TRIM(date) = ?")
         params.append(norm_date)
 
+    teacher_key = _normalize_search_key(teacher)
+    if teacher_key:
+        # Pre-filter in SQL to keep rows that have a non-empty teacher. The
+        # case-insensitive substring match itself still has to happen in Python
+        # because SQLite's built-in LOWER() does not fold Cyrillic letters
+        # (it would need the ICU extension, which is rarely available).
+        clauses.append(
+            "teacher IS NOT NULL AND TRIM(teacher) != ''"
+        )
+
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         SELECT id, date, group_name, lesson_number, time_start,
@@ -256,14 +266,12 @@ def query_lessons(
         ORDER BY id ASC
     """
 
-    teacher_key = _normalize_search_key(teacher)
-
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
         matched_rows: list[sqlite3.Row] = []
         for r in rows:
-            row_teacher = r["teacher"]
             if teacher_key:
+                row_teacher = r["teacher"]
                 if not row_teacher:
                     continue
                 if teacher_key not in _normalize_search_key(row_teacher):
@@ -290,7 +298,7 @@ def query_lessons(
                     "subject": r["subject"],
                     "lesson_type": r["lesson_type"],
                     "teacher": r["teacher"],
-                    "room": r["room"] if "room" in r.keys() else None,
+                    "room": r["room"],
                     "meeting_url": r["meeting_url"],
                     "meeting_code": r["meeting_code"],
                     "meeting_password": r["meeting_password"],

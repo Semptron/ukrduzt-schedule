@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 from typing import Any
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from database import (
     get_recent_changes,
@@ -18,7 +21,9 @@ from scraper import run_sync
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ukrduzt-backend")
 
-SYNC_INTERVAL_SECONDS = 3600
+# Sync cadence is configurable so the same image can run with a shorter
+# interval in staging and a longer one in production.
+SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
 
 _sync_lock = threading.Lock()
 _sync_in_progress = False
@@ -82,6 +87,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="UkrDUZT Correspondence Schedule API", lifespan=lifespan)
 
+# Compress JSON responses > ~1 KB — schedule payloads can be a few hundred KB.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# CORS: API is consumed by the Flutter app and any browser client.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/")
 def root():
@@ -93,11 +110,11 @@ def root():
             "/api/v1/groups",
             "/api/v1/teachers",
             "/api/v1/schedule",
-            "/api/v1/search",
             "/api/v1/stats",
             "/api/v1/changes",
             "/api/v1/sync",
             "/api/v1/bells",
+            "/api/v1/version",
         ],
     }
 
@@ -124,12 +141,15 @@ def get_bells():
 
 
 @app.get("/api/v1/groups")
-def get_groups():
+def get_groups(response: Response):
+    # Groups change slowly — let caches hold them for a minute.
+    response.headers["Cache-Control"] = "public, max-age=60"
     return {"groups": list_groups()}
 
 
 @app.get("/api/v1/teachers")
-def get_teachers():
+def get_teachers(response: Response):
+    response.headers["Cache-Control"] = "public, max-age=60"
     return {"teachers": list_teachers()}
 
 
@@ -178,6 +198,7 @@ def get_schedule(
     group: str | None = Query(None, description="Наприклад: 101-ЛЛГ-з26 або потік"),
     teacher: str | None = Query(None, description="Частина ПІБ викладача"),
     date: str | None = Query(None, description="Формат ДД.ММ.РРРР"),
+    response: Response = None,
 ):
     clean_group = _normalize_query_text(group)
     clean_teacher = _normalize_query_text(teacher)
@@ -196,7 +217,20 @@ def get_schedule(
 
     if not items:
         raise HTTPException(status_code=404, detail="Розклад не знайдено")
+    # A specific schedule is stable for the day — let CDN/proxies cache it.
+    if response is not None:
+        response.headers["Cache-Control"] = "public, max-age=300"
     return {"items": items}
+
+
+@app.get("/api/v1/version")
+def get_version():
+    """Lightweight endpoint for clients to detect breaking API changes."""
+    return {
+        "api_version": "v1",
+        "sync_interval_seconds": SYNC_INTERVAL_SECONDS,
+        "sync_in_progress": _sync_in_progress,
+    }
 
 
 @app.post("/api/v1/sync")

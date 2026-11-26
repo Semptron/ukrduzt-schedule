@@ -228,13 +228,18 @@ def _extract_full_dates_from_text(line: str) -> list[str]:
             tokens.append((m.start(), norm))
     for m in REVERSED_DATE_RE.finditer(line):
         y_rev, m_rev, d_rev = m.groups()
-        # Skip already-normal YYYY.MM.DD (year starts with 20)
-        if y_rev.startswith("20") and 2020 <= int(y_rev) <= 2035:
+        # This pattern matches both genuine ISO dates (YYYY.MM.DD) and dates
+        # pdfplumber occasionally returns right-to-left (6202.11.42). Try the
+        # forward reading first; only if that's not a valid date do we reverse
+        # the digit order. This keeps "2026.11.24" and "6202.11.42" both valid.
+        forward_norm = _normalize_date_parts(d_rev, m_rev, y_rev)
+        if forward_norm:
+            tokens.append((m.start(), forward_norm))
             continue
         y, mo, d = y_rev[::-1], m_rev[::-1], d_rev[::-1]
-        norm = _normalize_date_parts(d, mo, y)
-        if norm:
-            tokens.append((m.start(), norm))
+        rev_norm = _normalize_date_parts(d, mo, y)
+        if rev_norm:
+            tokens.append((m.start(), rev_norm))
     tokens.sort(key=lambda t: t[0])
     dates: list[str] = []
     for _, norm in tokens:
