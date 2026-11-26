@@ -70,6 +70,16 @@ def test_extract_dates_numeric_and_ukrainian_text():
     assert _extract_dates_from_text("5 листопада 2026") == ["05.11.2026"]
 
 
+def test_extract_dates_reversed_and_iso():
+    # pdfplumber sometimes returns dates right-to-left: 6202.11.42 → 24.11.2026
+    assert _extract_dates_from_text("6202.11.42") == ["24.11.2026"]
+    # A genuine ISO date YYYY.MM.DD with a plausible academic year must NOT be
+    # re-reversed into a garbage date.
+    assert _extract_dates_from_text("2026.11.24") == ["24.11.2026"]
+    # And an ISO date with a non-academic year should not be picked up at all.
+    assert _extract_dates_from_text("1999.11.24") == []
+
+
 def test_parse_schedule_pdf_detailed_text_fallback(tmp_path: Path):
     pdf_file = tmp_path / "sample.pdf"
     # Мінімальний валідний односторінковий PDF із текстовим рядком
