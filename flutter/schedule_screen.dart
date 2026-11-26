@@ -30,6 +30,8 @@ bool _isValidGroupName(String raw) {
     'семестр',
     'упп',
     'економічний',
+    'загальний потік',
+    'потік',
   ];
   for (final frag in forbiddenFragments) {
     if (lower.contains(frag)) return false;
@@ -116,6 +118,7 @@ class LessonModel {
   final String subject;
   final String? lessonType;
   final String? teacher;
+  final String? room;
   final String? serverMeetingUrl;
   final String? serverMeetingCode;
   final String? serverMeetingPassword;
@@ -129,6 +132,7 @@ class LessonModel {
     required this.subject,
     this.lessonType,
     this.teacher,
+    this.room,
     this.serverMeetingUrl,
     this.serverMeetingCode,
     this.serverMeetingPassword,
@@ -139,10 +143,13 @@ class LessonModel {
     final lessonNum = rawNum is int
         ? rawNum
         : int.tryParse(rawNum?.toString() ?? '') ?? 1;
-    final bell = kBells.cast<BellSlot?>().firstWhere(
-          (b) => b?.number == lessonNum,
-          orElse: () => null,
-        );
+    BellSlot? bell;
+    for (final b in kBells) {
+      if (b.number == lessonNum) {
+        bell = b;
+        break;
+      }
+    }
 
     return LessonModel(
       date: (json['date'] ?? '').toString().trim(),
@@ -153,6 +160,7 @@ class LessonModel {
       subject: (json['subject'] ?? 'Без назви').toString().trim(),
       lessonType: json['lesson_type'] as String?,
       teacher: json['teacher'] as String?,
+      room: json['room'] as String?,
       serverMeetingUrl: json['meeting_url'] as String?,
       serverMeetingCode: json['meeting_code'] as String?,
       serverMeetingPassword: json['meeting_password'] as String?,
@@ -168,6 +176,7 @@ class LessonModel {
         'subject': subject,
         'lesson_type': lessonType,
         'teacher': teacher,
+        'room': room,
         'meeting_url': serverMeetingUrl,
         'meeting_code': serverMeetingCode,
         'meeting_password': serverMeetingPassword,
@@ -178,6 +187,20 @@ String buildMeetingKey({required String subject, String? teacher}) {
   final normSubject = subject.trim().toLowerCase();
   final normTeacher = (teacher ?? '').trim().toLowerCase();
   return '$normSubject|$normTeacher';
+}
+
+
+String? displayTeacher(String? raw) {
+  if (raw == null) return null;
+  final t = raw.trim();
+  if (t.length < 4 || t.length > 60) return null;
+  if (RegExp(r'^\d+\.[\wА-Яа-яІіЇїЄєҐґ]+$').hasMatch(t)) return null;
+  if (t.toLowerCase().contains('http') || t.toLowerCase().contains('zoom')) {
+    return null;
+  }
+  if (!RegExp(r'[А-Яа-яІіЇїЄєҐґ]').hasMatch(t)) return null;
+  if (!RegExp(r'^[А-ЯІЇЄҐ]').hasMatch(t)) return null;
+  return t;
 }
 
 String buildNoteKey(LessonModel lesson) {
@@ -1015,11 +1038,13 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                               final zoomCfg = _getZoomConfig(item);
                               final note = _lessonNotes[buildNoteKey(item)];
                               final metaParts = <String>[
-                                '${item.lessonNumber} пара (${item.timeStart}\u2013${item.timeEnd})',
+                                '${item.lessonNumber} пара (${item.timeStart}–${item.timeEnd})',
                                 if (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
                                   item.lessonType!.trim(),
-                                if (item.teacher != null && item.teacher!.trim().isNotEmpty)
-                                  item.teacher!.trim(),
+                                if (item.room != null && item.room!.trim().isNotEmpty)
+                                  item.room!.trim(),
+                                if (displayTeacher(item.teacher) != null)
+                                  displayTeacher(item.teacher)!,
                               ];
 
                               return Card(
