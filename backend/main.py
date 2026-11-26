@@ -83,6 +83,36 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="UkrDUZT Correspondence Schedule API", lifespan=lifespan)
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "ukrduzt-schedule",
+        "status": "ok",
+        "docs": "/docs",
+        "endpoints": [
+            "/api/v1/groups",
+            "/api/v1/teachers",
+            "/api/v1/schedule",
+            "/api/v1/search",
+            "/api/v1/stats",
+            "/api/v1/changes",
+            "/api/v1/sync",
+            "/api/v1/bells",
+        ],
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "sync_in_progress": _sync_in_progress,
+        "last_stats": _last_sync_stats,
+        "last_error": _last_sync_error,
+    }
+
+
+
 @app.get("/api/v1/bells")
 def get_bells():
     return {
@@ -101,6 +131,41 @@ def get_groups():
 @app.get("/api/v1/teachers")
 def get_teachers():
     return {"teachers": list_teachers()}
+
+
+@app.get("/api/v1/stats")
+def get_stats():
+    """Aggregate quality snapshot of the current schedule DB."""
+    from database import get_connection
+    from quality import quality_report, is_valid_group, is_valid_teacher
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT date, group_name, lesson_number, subject, room,
+                   lesson_type, teacher, meeting_url
+            FROM lessons
+            """
+        ).fetchall()
+        items = [
+            {
+                "date": r["date"],
+                "group": r["group_name"],
+                "lesson_number": r["lesson_number"],
+                "subject": r["subject"],
+                "room": r["room"],
+                "lesson_type": r["lesson_type"],
+                "teacher": r["teacher"],
+                "meeting_url": r["meeting_url"],
+            }
+            for r in rows
+        ]
+    report = quality_report(items)
+    report["valid_groups"] = sum(1 for i in items if is_valid_group(i.get("group")))
+    report["valid_teachers_rows"] = sum(
+        1 for i in items if is_valid_teacher(i.get("teacher"))
+    )
+    return report
 
 
 @app.get("/api/v1/changes")
