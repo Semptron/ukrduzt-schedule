@@ -34,7 +34,7 @@ jobs:
           cache: true
 
       - name: Cache Gradle and pub
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
@@ -47,6 +47,7 @@ jobs:
 
       - name: Create Flutter project and copy app files
         run: |
+          set -e
           flutter create --org ua.edu.kart.schedule ukrduzt_app
           rm -rf ukrduzt_app/test/*
           rm -rf ukrduzt_app/lib/*
@@ -70,8 +71,12 @@ jobs:
           from pathlib import Path
 
           pubspec = Path("ukrduzt_app/pubspec.yaml")
-          snippet = Path("flutter/pubspec_dependencies_snippet.txt").read_text(encoding="utf-8")
+          snippet_path = Path("flutter/pubspec_dependencies_snippet.txt")
+          if not snippet_path.exists():
+              raise SystemExit(0)
+
           text = pubspec.read_text(encoding="utf-8")
+          snippet = snippet_path.read_text(encoding="utf-8")
 
           deps = []
           for line in snippet.splitlines():
