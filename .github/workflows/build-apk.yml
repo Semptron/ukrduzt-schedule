@@ -48,9 +48,21 @@ jobs:
       - name: Create Flutter project and copy app files
         run: |
           flutter create --org ua.edu.kart.schedule ukrduzt_app
-          rm -f ukrduzt_app/test/widget_test.dart
+          rm -rf ukrduzt_app/test/*
           rm -rf ukrduzt_app/lib/*
           cp -r flutter/. ukrduzt_app/lib/
+          mkdir -p ukrduzt_app/test
+          cat > ukrduzt_app/test/app_smoke_test.dart <<'EOF'
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:ukrduzt_app/main.dart';
+
+          void main() {
+            testWidgets('App widget builds without crashing', (WidgetTester tester) async {
+              await tester.pumpWidget(const UkrduztCorrespondenceApp());
+              expect(find.byType(UkrduztCorrespondenceApp), findsOneWidget);
+            });
+          }
+          EOF
 
       - name: Configure pubspec.yaml
         run: |
