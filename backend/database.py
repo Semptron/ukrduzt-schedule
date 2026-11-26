@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 from parser import normalize_teacher_name
+from quality import is_valid_group, is_valid_teacher, sanitize_lesson
 
 DB_PATH = Path("data/schedule.db")
 
@@ -206,7 +207,7 @@ def list_groups() -> list[str]:
             WHERE TRIM(group_name) != ''
             """
         ).fetchall()
-        groups = [r["group_name"] for r in rows]
+        groups = [r["group_name"] for r in rows if is_valid_group(r["group_name"])]
         return sorted(groups, key=_ua_sort_key)
 
 
@@ -223,6 +224,7 @@ def list_teachers() -> list[str]:
             norm
             for r in rows
             if (norm := normalize_teacher_name(r["teacher"])) is not None
+            and is_valid_teacher(norm)
         }
         return sorted(cleaned, key=_ua_sort_key)
 
@@ -247,7 +249,7 @@ def query_lessons(
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         SELECT id, date, group_name, lesson_number, time_start,
-               time_end, subject, lesson_type, teacher,
+               time_end, subject, room, lesson_type, teacher,
                meeting_url, meeting_code, meeting_password
         FROM lessons
         {where_sql}
@@ -276,22 +278,27 @@ def query_lessons(
             )
         )
 
-        return [
-            {
-                "date": r["date"],
-                "group": r["group_name"],
-                "lesson_number": r["lesson_number"],
-                "time_start": r["time_start"],
-                "time_end": r["time_end"],
-                "subject": r["subject"],
-                "lesson_type": r["lesson_type"],
-                "teacher": r["teacher"],
-                "meeting_url": r["meeting_url"],
-                "meeting_code": r["meeting_code"],
-                "meeting_password": r["meeting_password"],
-            }
-            for r in matched_rows
-        ]
+        results = []
+        for r in matched_rows:
+            item = sanitize_lesson(
+                {
+                    "date": r["date"],
+                    "group": r["group_name"],
+                    "lesson_number": r["lesson_number"],
+                    "time_start": r["time_start"],
+                    "time_end": r["time_end"],
+                    "subject": r["subject"],
+                    "lesson_type": r["lesson_type"],
+                    "teacher": r["teacher"],
+                    "room": r["room"] if "room" in r.keys() else None,
+                    "meeting_url": r["meeting_url"],
+                    "meeting_code": r["meeting_code"],
+                    "meeting_password": r["meeting_password"],
+                }
+            )
+            if item:
+                results.append(item)
+        return results
 
 
 def get_recent_changes(limit: int = 20) -> list[dict]:
