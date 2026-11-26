@@ -141,85 +141,86 @@ jobs:
           from pathlib import Path
           import re
 
-          app_dir = Path("ukrduzt_app/android/app")
-          gradle_groovy = app_dir / "build.gradle"
-          gradle_kts = app_dir / "build.gradle.kts"
+          gradle = Path("ukrduzt_app/android/app/build.gradle")
+          if not gradle.exists():
+              raise FileNotFoundError("build.gradle not found")
 
-          if gradle_groovy.exists():
-              text = gradle_groovy.read_text(encoding="utf-8")
-              if "keystoreProperties" not in text:
-                  props_block = """
-          def keystoreProperties = new Properties()
-          def keystorePropertiesFile = rootProject.file("key.properties")
-          if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-          }
-          """
-                  text = re.sub(r"(android\s*\{)", props_block + r"\1", text, count=1)
+          text = gradle.read_text(encoding="utf-8")
 
-              if "signingConfigs" not in text:
-                  sc_block = """
-              signingConfigs {
-                  release {
-                      keyAlias keystoreProperties["keyAlias"]
-                      keyPassword keystoreProperties["keyPassword"]
-                      storeFile keystoreProperties["storeFile"] ? file(keystoreProperties["storeFile"]) : null
-                      storePassword keystoreProperties["storePassword"]
-                  }
-              }
-          """
-                  text = re.sub(r"(buildTypes\s*\{)", sc_block + r"\1", text, count=1)
+          def find_block(src: str, keyword: str, start_from: int = 0):
+              m = re.search(rf"\b{re.escape(keyword)}\s*\{{", src[start_from:])
+              if not m:
+                  return None
+              open_idx = start_from + m.end() - 1
+              depth = 0
+              for i in range(open_idx, len(src)):
+                  ch = src[i]
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return (start_from + m.start(), open_idx, i)
+              return None
 
-              if "signingConfig signingConfigs.release" not in text:
-                  text = re.sub(
-                      r"(release\s*\{[^}]*?)(\s*\})",
-                      r"\1            signingConfig signingConfigs.release\2",
-                      text,
-                      count=1,
-                      flags=re.DOTALL,
-                  )
+          if "def keystoreProperties =" not in text:
+              props_code = (
+                  'def keystoreProperties = new Properties()\n'
+                  'def keystorePropertiesFile = rootProject.file("key.properties")\n'
+                  'if (keystorePropertiesFile.exists()) {\n'
+                  '    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n'
+                  '}\n\n'
+              )
+              android_blk = find_block(text, "android")
+              if android_blk:
+                  text = text[:android_blk[0]] + props_code + text[android_blk[0]:]
 
-              gradle_groovy.write_text(text, encoding="utf-8")
+          release_cfg = (
+              '        release {\n'
+              '            keyAlias keystoreProperties["keyAlias"]\n'
+              '            keyPassword keystoreProperties["keyPassword"]\n'
+              '            storeFile keystoreProperties["storeFile"] ? file(keystoreProperties["storeFile"]) : null\n'
+              '            storePassword keystoreProperties["storePassword"]\n'
+              '        }\n'
+          )
 
-          elif gradle_kts.exists():
-              text = gradle_kts.read_text(encoding="utf-8")
-              if "keystoreProperties" not in text:
-                  import_line = "import java.util.Properties\nimport java.io.FileInputStream\n\n"
-                  props_block = """
-          val keystoreProperties = Properties()
-          val keystorePropertiesFile = rootProject.file("key.properties")
-          if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-          }
-          """
-                  text = import_line + re.sub(r"(android\s*\{)", props_block + r"\1", text, count=1)
+          android_blk = find_block(text, "android")
+          if android_blk:
+              _, a_open, a_close = android_blk
+              sc_blk = find_block(text, "signingConfigs", a_open)
+              if sc_blk and sc_blk[2] < a_close:
+                  if "release" not in text[sc_blk[1]:sc_blk[2]]:
+                      insert_pos = sc_blk[1] + 1
+                      text = text[:insert_pos] + "\n" + release_cfg + text[insert_pos:]
+              else:
+                  bt_blk = find_block(text, "buildTypes", a_open)
+                  sc_block_full = f"    signingConfigs {{\n{release_cfg}    }}\n\n"
+                  if bt_blk and bt_blk[2] < a_close:
+                      text = text[:bt_blk[0]] + sc_block_full + text[bt_blk[0]:]
+                  else:
+                      text = text[:a_close] + "\n" + sc_block_full + text[a_close:]
 
-              if "signingConfigs" not in text:
-                  sc_block = """
-              signingConfigs {
-                  create("release") {
-                      keyAlias = keystoreProperties.getProperty("keyAlias")
-                      keyPassword = keystoreProperties.getProperty("keyPassword")
-                      val storeFilePath = keystoreProperties.getProperty("storeFile")
-                      storeFile = if (!storeFilePath.isNullOrBlank()) file(storeFilePath) else null
-                      storePassword = keystoreProperties.getProperty("storePassword")
-                  }
-              }
-          """
-                  text = re.sub(r"(buildTypes\s*\{)", sc_block + r"\1", text, count=1)
+          android_blk = find_block(text, "android")
+          if android_blk:
+              _, a_open, a_close = android_blk
+              bt_blk = find_block(text, "buildTypes", a_open)
+              if bt_blk and bt_blk[2] < a_close:
+                  rel_blk = find_block(text, "release", bt_blk[1])
+                  if rel_blk and rel_blk[2] < bt_blk[2]:
+                      rel_body = text[rel_blk[1] + 1:rel_blk[2]]
+                      if "signingConfigs.release" not in rel_body:
+                          if re.search(r"\bsigningConfig\b[^\r\n]*", rel_body):
+                              rel_body_new = re.sub(
+                                  r"\bsigningConfig\b[^\r\n]*",
+                                  "signingConfig signingConfigs.release",
+                                  rel_body,
+                                  count=1,
+                              )
+                          else:
+                              rel_body_new = "\n            signingConfig signingConfigs.release" + rel_body
+                          text = text[:rel_blk[1] + 1] + rel_body_new + text[rel_blk[2]:]
 
-              if 'signingConfig = signingConfigs.getByName("release")' not in text:
-                  text = re.sub(
-                      r'(getByName\("release"\)\s*\{[^}]*?)(\s*\})',
-                      r'\1            signingConfig = signingConfigs.getByName("release")\2',
-                      text,
-                      count=1,
-                      flags=re.DOTALL,
-                  )
-
-              gradle_kts.write_text(text, encoding="utf-8")
-          else:
-              raise FileNotFoundError("Neither build.gradle nor build.gradle.kts found in android/app")
+          gradle.write_text(text, encoding="utf-8")
           PY
 
       - name: Install packages, analyze and test
