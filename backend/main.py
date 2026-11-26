@@ -27,6 +27,7 @@ SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
 
 _sync_lock = threading.Lock()
 _sync_in_progress = False
+_initial_sync_done = False
 _last_sync_stats: dict[str, Any] | None = None
 _last_sync_error: str | None = None
 
@@ -39,7 +40,7 @@ def _normalize_query_text(value: str | None) -> str | None:
 
 
 def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
-    global _sync_in_progress, _last_sync_stats, _last_sync_error
+    global _sync_in_progress, _initial_sync_done, _last_sync_stats, _last_sync_error
 
     if not _sync_lock.acquire(blocking=False):
         return None
@@ -49,10 +50,12 @@ def _execute_sync_safe(force: bool = False) -> dict[str, Any] | None:
         stats = run_sync(force=force)
         _last_sync_stats = stats
         _last_sync_error = None
+        _initial_sync_done = True
         logger.info("Schedule sync finished: %s", stats)
         return stats
     except Exception as exc:
         _last_sync_error = str(exc)
+        _initial_sync_done = True
         logger.warning("Schedule sync error: %s", exc)
         return None
     finally:
@@ -124,10 +127,10 @@ def health():
     return {
         "status": "ok",
         "sync_in_progress": _sync_in_progress,
+        "initial_sync_done": _initial_sync_done,
         "last_stats": _last_sync_stats,
         "last_error": _last_sync_error,
     }
-
 
 
 @app.get("/api/v1/bells")
@@ -216,7 +219,14 @@ def get_schedule(
     )
 
     if not items:
+        if _sync_in_progress and not _initial_sync_done:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Триває первинна синхронізація розкладу після запуску сервера",
+                headers={"Retry-After": "10"},
+            )
         raise HTTPException(status_code=404, detail="Розклад не знайдено")
+
     # A specific schedule is stable for the day — let CDN/proxies cache it.
     if response is not None:
         response.headers["Cache-Control"] = "public, max-age=300"
@@ -230,6 +240,7 @@ def get_version():
         "api_version": "v1",
         "sync_interval_seconds": SYNC_INTERVAL_SECONDS,
         "sync_in_progress": _sync_in_progress,
+        "initial_sync_done": _initial_sync_done,
     }
 
 
