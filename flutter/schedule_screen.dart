@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -189,7 +190,6 @@ String buildMeetingKey({required String subject, String? teacher}) {
   return '$normSubject|$normTeacher';
 }
 
-
 String? displayTeacher(String? raw) {
   if (raw == null) return null;
   final t = raw.trim();
@@ -264,9 +264,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     _initScreen();
     _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) return;
-      // The live "in progress / starts in X min" status only matters for the
-      // featured card on the single-day view. In "all days" mode the ticker
-      // would rebuild a potentially long list for no reason, so skip it.
       if (_showAllDates) return;
       setState(() {});
     });
@@ -465,8 +462,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         setState(() {
           _groups = list;
           if (groupChanged) {
-            // Avoid showing the previous group's lessons under the new group
-            // name while the fresh schedule is being fetched.
             _selectedGroup = nextGroup;
             _lessons = [];
             _selectedDate = null;
@@ -585,7 +580,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     await _fetchSchedule(prefs, showSpinnerIfEmpty: cached.isEmpty);
   }
 
-  /// User tapped the "Спробувати знову" button on the error panel.
   Future<void> _retryFetch() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -596,7 +590,6 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     await _fetchSchedule(prefs, showSpinnerIfEmpty: _lessons.isEmpty);
   }
 
-  /// Pull-to-refresh handler — clears the error and forces a network fetch.
   Future<void> _handleRefresh() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() => _error = null);
@@ -637,6 +630,82 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('$label скопійовано: $value')),
     );
+  }
+
+  String _formatDayForTelegram(String dateStr, List<LessonModel> dayLessons) {
+    final buffer = StringBuffer()
+      ..writeln('📅 Розклад • $_selectedGroup • $dateStr')
+      ..writeln();
+
+    for (final item in dayLessons) {
+      final typeSuffix =
+          (item.lessonType != null && item.lessonType!.trim().isNotEmpty)
+              ? ' (${item.lessonType!.trim()})'
+              : '';
+      buffer.writeln(
+        '${item.lessonNumber} пара (${item.timeStart}–${item.timeEnd}) — ${item.subject}$typeSuffix',
+      );
+
+      final details = <String>[
+        if (displayTeacher(item.teacher) != null)
+          '👨‍🏫 ${displayTeacher(item.teacher)!}',
+        if (item.room != null && item.room!.trim().isNotEmpty)
+          '📍 ${item.room!.trim()}',
+      ];
+      if (details.isNotEmpty) {
+        buffer.writeln(details.join(' • '));
+      }
+
+      final zoomCfg = _getZoomConfig(item);
+      if (zoomCfg != null) {
+        if (zoomCfg.mode == 'link' && (zoomCfg.url ?? '').trim().isNotEmpty) {
+          final rawUrl = zoomCfg.url!.trim();
+          final normalizedUrl =
+              rawUrl.startsWith('http://') || rawUrl.startsWith('https://')
+                  ? rawUrl
+                  : 'https://$rawUrl';
+          buffer.writeln('🔗 Zoom: $normalizedUrl');
+        } else {
+          final cleanCode =
+              (zoomCfg.meetingCode ?? '').replaceAll(RegExp(r'\s+'), '');
+          final pwd = (zoomCfg.password ?? '').trim();
+          if (cleanCode.isNotEmpty) {
+            final query =
+                pwd.isNotEmpty ? '?pwd=${Uri.encodeComponent(pwd)}' : '';
+            buffer.writeln('🔗 Zoom: https://zoom.us/j/$cleanCode$query');
+          }
+          final credParts = <String>[
+            if ((zoomCfg.meetingCode ?? '').trim().isNotEmpty)
+              'ID: ${zoomCfg.meetingCode!.trim()}',
+            if (pwd.isNotEmpty) 'Пароль: $pwd',
+          ];
+          if (credParts.isNotEmpty) {
+            buffer.writeln('🔑 ${credParts.join(' • ')}');
+          }
+        }
+      }
+
+      final note = _lessonNotes[buildNoteKey(item)];
+      if (note != null && note.trim().isNotEmpty) {
+        buffer.writeln('📝 ${note.trim()}');
+      }
+
+      buffer.writeln();
+    }
+
+    return buffer.toString().trim();
+  }
+
+  Future<void> _shareDaySchedule(String dateStr, List<LessonModel> dayLessons) async {
+    if (dayLessons.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('На $dateStr пар немає')),
+      );
+      return;
+    }
+
+    final text = _formatDayForTelegram(dateStr, dayLessons);
+    await Share.share(text);
   }
 
   Future<void> _showZoomDialog(LessonModel lesson) async {
@@ -909,6 +978,10 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
     final activeDate = _selectedDate ?? todayStr;
     final visibleLessons = _buildVisibleLessons(activeDate);
     final featuredLesson = _findActiveOrNextLesson(_lessons);
+    final selectedDayLessons = _lessons
+        .where((l) => l.date.trim() == activeDate.trim())
+        .toList()
+      ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
 
     return Scaffold(
       appBar: AppBar(
@@ -999,6 +1072,14 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
                   selected: _showAllDates,
                   onSelected: (val) => setState(() => _showAllDates = val),
                 ),
+                const Spacer(),
+                if (!_showAllDates && selectedDayLessons.isNotEmpty)
+                  ActionChip(
+                    avatar: const Icon(Icons.send_outlined, size: 18),
+                    label: const Text('В Telegram'),
+                    onPressed: () =>
+                        _shareDaySchedule(activeDate, selectedDayLessons),
+                  ),
               ],
             ),
           ),
