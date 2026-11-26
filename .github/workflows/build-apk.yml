@@ -1,3 +1,119 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          cache: true
+
+      - name: Cache Gradle and pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ukrduzt_app/.dart_tool
+            ukrduzt_app/build
+          key: ${{ runner.os }}-gradle-pub-${{ hashFiles('flutter/**', '**/pubspec.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-pub-
+
+      - name: Create Flutter project and copy app files
+        run: |
+          flutter create --org ua.edu.kart.schedule ukrduzt_app
+          rm -rf ukrduzt_app/test/*
+          rm -rf ukrduzt_app/lib/*
+          cp -r flutter/. ukrduzt_app/lib/
+          mkdir -p ukrduzt_app/test
+          cat > ukrduzt_app/test/app_smoke_test.dart <<'EOF'
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:ukrduzt_app/main.dart';
+
+          void main() {
+            testWidgets('App widget builds without crashing', (WidgetTester tester) async {
+              await tester.pumpWidget(const UkrduztCorrespondenceApp());
+              expect(find.byType(UkrduztCorrespondenceApp), findsOneWidget);
+            });
+          }
+          EOF
+
+      - name: Configure pubspec.yaml
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          pubspec = Path("ukrduzt_app/pubspec.yaml")
+          snippet = Path("flutter/pubspec_dependencies_snippet.txt").read_text(encoding="utf-8")
+          text = pubspec.read_text(encoding="utf-8")
+
+          deps = []
+          for line in snippet.splitlines():
+              stripped = line.strip()
+              if not stripped or stripped.startswith("dependencies:") or stripped.startswith("flutter:"):
+                  continue
+              if stripped.startswith("sdk:"):
+                  continue
+              if line.startswith("  "):
+                  deps.append(line.rstrip("\n"))
+
+          anchor = "  cupertino_icons: ^1.0.8\n"
+          insert_after = anchor if anchor in text else "dependencies:\n"
+          for line in deps:
+              name = line.split(":", 1)[0].strip()
+              if f"  {name}:" in text:
+                  continue
+              text = text.replace(insert_after, insert_after + line + "\n", 1)
+              insert_after = line + "\n"
+
+          pubspec.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Ensure INTERNET permission in AndroidManifest.xml
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          manifest = Path("ukrduzt_app/android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          perm = '    <uses-permission android:name="android.permission.INTERNET" />\n'
+
+          if "android.permission.INTERNET" not in text:
+              if re.search(r"<manifest\b[^>]*>\s*\n", text):
+                  text = re.sub(r"(<manifest\b[^>]*>\s*\n)", r"\1" + perm, text, count=1)
+              else:
+                  text = re.sub(r"(<application\b)", perm + r"\1", text, count=1)
+
+          manifest.write_text(text, encoding="utf-8")
+          PY
+
       - name: Decode signing keystore and configure Gradle
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -111,3 +227,34 @@
 
           gradle.write_text(text, encoding="utf-8")
           PY
+
+      - name: Install packages, analyze and test
+        working-directory: ukrduzt_app
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test
+
+      - name: Build release APK (split per ABI)
+        working-directory: ukrduzt_app
+        run: flutter build apk --release --split-per-abi
+
+      - name: Rename APKs with commit SHA
+        working-directory: ukrduzt_app
+        run: |
+          set -e
+          sha="${{ github.sha }}"
+          short="${sha:0:7}"
+          out_dir="build/app/outputs/flutter-apk"
+          for apk in "$out_dir"/app-*-release.apk; do
+            abi=$(basename "$apk" | sed -E 's/^app-(.+)-release\.apk$/\1/')
+            mv "$apk" "$out_dir/ukrduzt-${short}-${abi}.apk"
+          done
+          ls -la "$out_dir"/ukrduzt-*.apk
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ukrduzt-schedule-apk-${{ github.sha }}
+          path: ukrduzt_app/build/app/outputs/flutter-apk/ukrduzt-*.apk
+          if-no-files-found: error
