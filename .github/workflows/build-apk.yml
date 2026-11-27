@@ -51,8 +51,16 @@ jobs:
           flutter create --org ua.edu.kart.schedule ukrduzt_app
           rm -rf ukrduzt_app/test/*
           rm -rf ukrduzt_app/lib/*
-          cp -r flutter/. ukrduzt_app/lib/
+          # Copy the dart sources from flutter/ into lib/ (excluding the test/ dir,
+          # which contains the unit tests and must land in ukrduzt_app/test/).
+          for f in flutter/*.dart; do
+            cp "$f" ukrduzt_app/lib/
+          done
+          # Unit tests exercise the pure helpers (LessonModel.fromJson etc.)
+          # and run on CI alongside the smoke test below.
           mkdir -p ukrduzt_app/test
+          cp -r flutter/test/. ukrduzt_app/test/
+          # Keep the smoke test as a final "the whole app builds" guard.
           cat > ukrduzt_app/test/app_smoke_test.dart <<'EOF'
           import 'package:flutter_test/flutter_test.dart';
           import 'package:ukrduzt_app/main.dart';
@@ -64,6 +72,7 @@ jobs:
             });
           }
           EOF
+          ls -la ukrduzt_app/test/ ukrduzt_app/lib/
 
       - name: Configure pubspec.yaml
         run: |
@@ -249,18 +258,37 @@ jobs:
 
       - name: Build release APK (split per ABI)
         working-directory: ukrduzt_app
+        env:
+          # API base URL baked into the APK. Override per-environment via the
+          # repo's Actions secret API_BASE_URL; falls back to the production
+          # endpoint when unset.
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
         run: |
           set -e
+          dart_define=""
+          if [ -n "$API_BASE_URL" ]; then
+            dart_define="--dart-define=API_BASE_URL=$API_BASE_URL"
+          fi
           attempt=1
           max_attempts=3
-          until flutter build apk --release --split-per-abi; do
-            if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "APK build failed after $max_attempts attempts"
-              exit 1
+          log_file=build_attempt.log
+          until flutter build apk --release --split-per-abi $dart_define 2>&1 | tee "$log_file"; do
+            build_status=${PIPESTATUS[0]}
+            # Only retry on transient Maven/repository rate-limits (429, 5xx,
+            # "Could not GET", "Connection timed out"). A real Dart/Gradle
+            # compile failure should fail fast so we don't waste 25 minutes.
+            if grep -Eiq "429|503|502|500|Could not (GET|HEAD)|Connection (timed out|refused)|Read timed out" "$log_file"; then
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "APK build failed after $max_attempts transient retries"
+                exit 1
+              fi
+              echo "Attempt $attempt hit a transient Maven/repository error, retrying in 15s..."
+              attempt=$((attempt + 1))
+              sleep 15
+              continue
             fi
-            echo "Attempt $attempt failed (possible Maven 429 rate limit), retrying in 15s..."
-            attempt=$((attempt + 1))
-            sleep 15
+            echo "Build failed with a non-transient error (not retrying)."
+            exit "$build_status"
           done
 
       - name: Rename APKs with commit SHA
