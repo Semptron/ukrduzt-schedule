@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'api_config.dart' show kApiBaseUrl;
 import 'schedule_screen.dart';
 import 'teacher_search_screen.dart';
 
@@ -9,8 +10,6 @@ void main() {
 
 class UkrduztCorrespondenceApp extends StatelessWidget {
   const UkrduztCorrespondenceApp({super.key});
-
-  static const String _apiBaseUrl = 'https://ukrduzt-schedule.onrender.com';
 
   @override
   Widget build(BuildContext context) {
@@ -32,7 +31,7 @@ class UkrduztCorrespondenceApp extends StatelessWidget {
         useMaterial3: true,
       ),
       themeMode: ThemeMode.system,
-      home: const _MainShell(apiBaseUrl: _apiBaseUrl),
+      home: const _MainShell(apiBaseUrl: kApiBaseUrl),
     );
   }
 }

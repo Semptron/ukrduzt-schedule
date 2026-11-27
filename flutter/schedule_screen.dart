@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'api_config.dart' show kApiBaseUrl, kHttpHeaders, kMetadataTimeout, kScheduleTimeout;
 
 const String kMoodleUrl = 'https://do.kart.edu.ua/';
 const String kZoomAppUrl = 'https://zoom.us/join';
@@ -13,6 +14,22 @@ const String kMeetingsPrefsKey = 'ukrduzt_zoom_configs_v1';
 const String kNotesPrefsKey = 'ukrduzt_lesson_notes_v1';
 const String kSelectedGroupPrefsKey = 'ukrduzt_selected_group_v1';
 const String kGroupsCachePrefsKey = 'ukrduzt_groups_cache_v2';
+
+/// "Today" is the portal's today (Europe/Kyiv), not the device's today.
+/// A student abroad on a phone set to local time would otherwise see the
+/// wrong day selected on first launch.
+DateTime kyivToday() {
+  final utcNow = DateTime.now().toUtc();
+  // Floor to a whole day so a 23:30 Kyiv moment still counts as "today".
+  final kyiv = utcNow.add(const Duration(hours: 2));
+  return DateTime(kyiv.year, kyiv.month, kyiv.day);
+}
+
+/// Same as kyivToday but keeps the time component — used for the "live"
+/// lesson progress indicator, since lesson times (BELLS) are Kyiv time.
+DateTime kyivNow() {
+  return DateTime.now().toUtc().add(const Duration(hours: 2));
+}
 
 String _scheduleCacheKey(String group) => 'ukrduzt_schedule_cache_$group';
 
@@ -235,7 +252,7 @@ class ScheduleScreen extends StatefulWidget {
 
   const ScheduleScreen({
     super.key,
-    this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
+    this.apiBaseUrl = kApiBaseUrl,
     this.initialGroup = '101-ЛЛГ-з26',
   });
 
@@ -243,7 +260,8 @@ class ScheduleScreen extends StatefulWidget {
   State<ScheduleScreen> createState() => _ScheduleScreenState();
 }
 
-class _ScheduleScreenState extends State<ScheduleScreen> {
+class _ScheduleScreenState extends State<ScheduleScreen>
+    with WidgetsBindingObserver {
   late String _selectedGroup;
   String? _selectedDate;
   bool _showAllDates = false;
@@ -260,8 +278,17 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _selectedGroup = widget.initialGroup;
     _initScreen();
+    // The ticker only fires while the app is in the foreground (see
+    // didChangeAppLifecycleState). When backgrounded, it is cancelled so the
+    // device can sleep instead of rebuilding the "live" indicator off-screen.
+    _startTicker();
+  }
+
+  void _startTicker() {
+    _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) return;
       if (_showAllDates) return;
@@ -270,7 +297,22 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      _ticker?.cancel();
+      _ticker = null;
+    } else if (state == AppLifecycleState.resumed) {
+      _startTicker();
+      // Force a fresh "now" render immediately after returning from
+      // background so the "live" badge isn't stale by minutes.
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     super.dispose();
   }
@@ -319,7 +361,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       });
     } else if (mounted) {
       setState(() {
-        _selectedDate ??= _formatDateDdMmYyyy(DateTime.now());
+        _selectedDate ??= _formatDateDdMmYyyy(kyivToday());
       });
     }
 
@@ -328,7 +370,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   String _pickInitialDate(List<LessonModel> items) {
-    final today = _dateOnly(DateTime.now());
+    final today = _dateOnly(kyivToday());
     final todayStr = _formatDateDdMmYyyy(today);
     final hasTodayLessons = items.any((l) => l.date.trim() == todayStr);
     if (hasTodayLessons) return todayStr;
@@ -361,7 +403,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
 
     parsedEntries.sort((a, b) => a.dt.compareTo(b.dt));
 
-    final today = _dateOnly(DateTime.now());
+    final today = _dateOnly(kyivToday());
     final filtered = fromTodayOnly
         ? parsedEntries.where((e) => !e.dt.isBefore(today)).toList()
         : parsedEntries;
@@ -446,7 +488,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   Future<void> _fetchGroups(SharedPreferences prefs) async {
     try {
       final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/groups');
-      final resp = await http.get(uri).timeout(const Duration(seconds: 65));
+      final resp = await http.get(uri, headers: kHttpHeaders)
+          .timeout(kMetadataTimeout);
       if (resp.statusCode != 200 || !mounted) return;
 
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
@@ -474,7 +517,11 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
           await prefs.setString(kSelectedGroupPrefsKey, nextGroup);
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      // Swallow is intentional: groups list is best-effort and falls back to
+      // the cache. Log in debug so a misconfigured API URL is visible.
+      debugPrint('_fetchGroups failed: $e');
+    }
   }
 
   Future<void> _fetchSchedule(
@@ -509,7 +556,8 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
         final uri = Uri.parse(
           '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}',
         );
-        final resp = await http.get(uri).timeout(const Duration(seconds: 65));
+        final resp = await http.get(uri, headers: kHttpHeaders)
+            .timeout(kScheduleTimeout);
 
         if (!mounted || reqId != _scheduleRequestId) return;
 
@@ -532,7 +580,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
           } else {
             setState(() {
               _lessons = [];
-              _selectedDate = _formatDateDdMmYyyy(DateTime.now());
+              _selectedDate = _formatDateDdMmYyyy(kyivToday());
               _loading = false;
               _offlineBanner = false;
               _error =
@@ -878,11 +926,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       ),
     );
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      urlController.dispose();
-      codeController.dispose();
-      passController.dispose();
-    });
+    // Dispose immediately after the dialog closes, before any async save
+    // work — avoids a race where a quickly reopened dialog reuses a not-yet-
+    // disposed controller.
+    urlController.dispose();
+    codeController.dispose();
+    passController.dispose();
 
     if (result != null && mounted) {
       await _saveZoomConfig(lesson, result);
@@ -918,9 +967,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
       ),
     );
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      controller.dispose();
-    });
+    controller.dispose();
 
     if (result != null && mounted) await _saveNote(lesson, result);
   }
@@ -939,7 +986,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   double _lessonProgress(LessonModel lesson) {
-    final now = DateTime.now();
+    final now = kyivNow();
     final start = _parseLessonDateTime(lesson.date, lesson.timeStart);
     final end = _parseLessonDateTime(lesson.date, lesson.timeEnd);
     if (start == null || end == null) return 0;
@@ -950,7 +997,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   String _liveStatusText(LessonModel lesson) {
-    final now = DateTime.now();
+    final now = kyivNow();
     final start = _parseLessonDateTime(lesson.date, lesson.timeStart);
     final end = _parseLessonDateTime(lesson.date, lesson.timeEnd);
     if (start == null || end == null) {
@@ -974,12 +1021,12 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   }
 
   LessonModel? _findActiveOrNextLesson(List<LessonModel> allLessons) {
-    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+    final todayStr = _formatDateDdMmYyyy(kyivToday());
     final todayItems = allLessons.where((l) => l.date.trim() == todayStr).toList()
       ..sort((a, b) => a.lessonNumber.compareTo(b.lessonNumber));
     if (todayItems.isEmpty) return null;
 
-    final now = DateTime.now();
+    final now = kyivNow();
     for (final l in todayItems) {
       final start = _parseLessonDateTime(l.date, l.timeStart);
       final end = _parseLessonDateTime(l.date, l.timeEnd);
@@ -1015,7 +1062,7 @@ class _ScheduleScreenState extends State<ScheduleScreen> {
   @override
   Widget build(BuildContext context) {
     final dates = _sortedDates(_lessons, fromTodayOnly: true);
-    final todayStr = _formatDateDdMmYyyy(DateTime.now());
+    final todayStr = _formatDateDdMmYyyy(kyivToday());
     final activeDate = _selectedDate ?? todayStr;
     final visibleLessons = _buildVisibleLessons(activeDate);
     final featuredLesson = _findActiveOrNextLesson(_lessons);

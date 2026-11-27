@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'api_config.dart' show kApiBaseUrl, kHttpHeaders, kMetadataTimeout, kScheduleTimeout;
 import 'schedule_screen.dart';
 
 
@@ -28,7 +29,7 @@ class TeacherSearchScreen extends StatefulWidget {
 
   const TeacherSearchScreen({
     super.key,
-    this.apiBaseUrl = 'https://ukrduzt-schedule.onrender.com',
+    this.apiBaseUrl = kApiBaseUrl,
     this.isActive = true,
   });
 
@@ -145,7 +146,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
 
     try {
       final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/teachers');
-      final resp = await http.get(uri).timeout(const Duration(seconds: 8));
+      final resp = await http.get(uri, headers: kHttpHeaders).timeout(kMetadataTimeout);
       if (resp.statusCode == 200 && mounted) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
         final apiTeachers = (data['teachers'] as List<dynamic>? ?? [])
@@ -180,7 +181,7 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
       final uri = Uri.parse(
         '${widget.apiBaseUrl}/api/v1/schedule?teacher=${Uri.encodeComponent(cleaned)}',
       );
-      final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+      final resp = await http.get(uri, headers: kHttpHeaders).timeout(kScheduleTimeout);
       if (!mounted || seq != _searchSeq) return;
 
       if (resp.statusCode == 404) {
