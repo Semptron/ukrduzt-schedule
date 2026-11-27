@@ -49,8 +49,10 @@ def is_valid_teacher(name: str | None) -> bool:
     normalized = normalize_teacher_name(n)
     if not normalized:
         return False
-    # Reject subject-like blobs that slipped through
-    if "," in normalized or "  " in normalized:
+    # Reject subject-like blobs that slipped through. normalize_teacher_name
+    # already collapses internal whitespace, so a double-space cannot occur;
+    # the comma is the real signal here.
+    if "," in normalized:
         return False
     return True
 

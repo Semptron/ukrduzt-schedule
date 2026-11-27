@@ -1,5 +1,5 @@
 """
-UkrDUZT correspondence schedule PDF parser (v2).
+UkrDUZT correspondence schedule PDF parser (v3).
 
 Primary strategy: table geometry from pdfplumber.
   - Header row → group columns (with x-ranges)
@@ -7,18 +7,24 @@ Primary strategy: table geometry from pdfplumber.
   - Pair number in col 1
   - Lesson cells: merged cells cover several groups via x-overlap
 
-Public API stays compatible with scraper/database:
-  parse_schedule_pdf_detailed(path) -> {lessons, warnings}
-  parse_schedule_pdf(path) -> list[dict]
+The entry point accepts either a path (str/Path) or an already-opened binary
+file object (``BytesIO``). When given a file object the caller must pass a
+``filename`` hint so the year can be inferred from the original file name.
+
+Public API:
+  parse_schedule_pdf_detailed(source, filename=None) -> {lessons, warnings}
+  parse_schedule_pdf(source, filename=None) -> list[dict]
   BELLS, clean_cell, detect_lesson_number, parse_cell_to_lesson, ...
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from pathlib import Path
+import io
+import os
 import re
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import pdfplumber
 
@@ -44,9 +50,12 @@ SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\.\d|\d)")
 # pdfplumber often extracts dates right-to-left: 6202.11.42 → 24.11.2026
 REVERSED_DATE_RE = re.compile(r"\b(\d{4})\.(\d{2})\.(\d{2})\b")
 
-LESSON_NUM_RE = re.compile(r"^[1-8]$")
+# Lessons 1-9 are supported. A real 10th pair is rare but we clamp gracefully
+# in detect_lesson_number rather than silently misnumber it as 8.
+MAX_LESSON_NUMBER = 9
+LESSON_NUM_RE = re.compile(r"^[1-9]$")
 PAIR_RE = re.compile(
-    r"(?:\b([1-8])\s*(?:та|і|,|-|–)?\s*([1-8])?\s*пар\w*|\b([1-8])\s*пара\b)",
+    r"(?:\b([1-9])\s*(?:та|і|,|-|–)?\s*([1-9])?\s*пар\w*|\b([1-9])\s*пара\b)",
     re.IGNORECASE,
 )
 
@@ -58,9 +67,24 @@ ROOM_RE = re.compile(r"\b\d+\.[А-Яа-яІіЇїЄєҐґA-Za-z0-9]{1,12}\b")
 URL_RE = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
 ZOOM_RE = re.compile(r"https?://(?:[a-z0-9-]+\.)*zoom\.us/[^\s,;]+", re.IGNORECASE)
 
+# Weekdays in normal order plus the reversed forms pdfplumber sometimes
+# emits. Comparison is case-insensitive on a lowercased input, so "КОРОТВІВ"
+# and "коротвіВ" both match.
+_WEEKDAYS = [
+    "понеділок", "вівторок", "середа", "четвер", "п'ятниця", "пятниця",
+    "субота", "неділя",
+    "коніделоп", "коротвів", "адерес", "ревтеч", "яцинтя.п", "атобус", "яліден",
+]
 WEEKDAY_RE = re.compile(
-    r"^(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя|"
-    r"коніделоп|коротвіВ|адереС|ревтеЧ|яцинтя.П|атобуС|ялідеН)$",
+    r"^(?:" + "|".join(re.escape(w) for w in _WEEKDAYS) + r")$",
+    re.IGNORECASE,
+)
+# Inline-stripped weekday prefix (used inside parse_cell_to_lesson) mirrors
+# the same set, but as a substitution pattern rather than a full-match.
+WEEKDAY_PREFIX_RE = re.compile(
+    r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя|"
+    r"коніделоп|коротвів|адерес|ревтеч|яцинтя.п|атобус|яліден)"
+    r"\s*[,.;:|()\-–]*\s*",
     re.IGNORECASE,
 )
 
@@ -95,12 +119,18 @@ TEACHER_EXACT_NOISE = {
     "інд. конс.", "інд. конс", "інд конс",
     "інд. консульт.", "індив. консульт.", "індивід. консультація",
 }
+# "Прізвище І.О." / "Прізвище І. О."
 SURNAME_WITH_INITIALS_RE = re.compile(
     r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.(?:\s*[А-ЯІЇЄҐ]\.){0,2}$"
 )
 FULL_NAME_RE = re.compile(
     r"^[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}"
     r"(?:\s+[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25})?$"
+)
+# Reversed form: "О. В. Панчук" / "О.В. Панчук" → swap to "Панчук О. В."
+INITS_THEN_SURNAME_RE = re.compile(
+    r"^([А-ЯІЇЄҐ])\.\s*([А-ЯІЇЄҐ])\.(?:\s*([А-ЯІЇЄҐ])\.)?\s*"
+    r"([А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25})$"
 )
 TEACHER_STOPWORDS = {
     "освіти", "кафедра", "факультет", "університет", "семестр", "курс",
@@ -128,7 +158,25 @@ BELLS: dict[int, tuple[str, str]] = {
     6: ("16:40", "18:00"),
     7: ("18:10", "19:30"),
     8: ("19:40", "21:00"),
+    # 9th pair is rare; if present, use a plausible late-evening slot. The
+    # parser still records it with this time so clients can show it.
+    9: ("21:10", "22:30"),
 }
+
+
+# ---------------------------------------------------------------------------
+# Timezone-aware "now"
+# ---------------------------------------------------------------------------
+
+def _now_local() -> datetime:
+    """Return the current local time.
+
+    The container should run with ``TZ=Europe/Kyiv`` (set in docker-compose).
+    We honour ``TZ`` via ``datetime.now()`` which respects the process locale.
+    If a future deployment overrides this, prefer passing ``fallback_year``
+    explicitly rather than relying on the wall clock.
+    """
+    return datetime.now()
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +240,14 @@ def _normalize_date_parts(day: str, month: str, year: str) -> str | None:
     return f"{d_val:02d}.{m_val:02d}.{y_val:04d}"
 
 
-def _extract_year_from_filename(pdf_path: str) -> str | None:
-    name = Path(pdf_path).name
+def _extract_year_from_filename(name: str) -> str | None:
+    """Pull an academic year hint out of a file name.
+
+    Accepts a bare string (not a Path/BytesIO) so this works both for on-disk
+    paths and for in-memory downloads where the caller passes the original
+    URL-derived name as a hint.
+    """
+    name = os.path.basename(name)
     full_years = re.findall(r"(?<!\d)(202[4-9]|203\d)(?!\d)", name)
     if full_years:
         return full_years[-1]
@@ -206,7 +260,7 @@ def _extract_year_from_filename(pdf_path: str) -> str | None:
 def _infer_year_for_month(month_num: int, fallback_year: str | None = None) -> str:
     if fallback_year and fallback_year.isdigit() and len(fallback_year) == 4:
         return fallback_year
-    now = datetime.now()
+    now = _now_local()
     if month_num >= 8 and now.month <= 3:
         return str(now.year - 1)
     if month_num <= 3 and now.month >= 8:
@@ -268,12 +322,6 @@ def _extract_dates_from_text(
             if formatted not in dates:
                 dates.append(formatted)
     return dates
-
-
-def _format_default_date(fallback_year: str | None) -> str:
-    y = fallback_year or str(datetime.now().year)
-    month = 11 if int(y) >= datetime.now().year else 3
-    return f"01.{month:02d}.{y}"
 
 
 def _normalize_lesson_type(raw: str | None) -> str | None:
@@ -354,6 +402,13 @@ def normalize_teacher_name(raw_teacher: str | None) -> str | None:
     # "Прізвище І." without trailing space noise
     if re.fullmatch(r"[А-ЯІЇЄҐ][а-яіїєґ'’`-]{1,25}\s+[А-ЯІЇЄҐ]\.", cleaned):
         return cleaned
+    # Reversed form: "О. В. Панчук" → "Панчук О. В."
+    swapped = INITS_THEN_SURNAME_RE.match(cleaned)
+    if swapped:
+        i1, i2, i3, surname = swapped.groups()
+        if i3:
+            return f"{surname} {i1}. {i2}. {i3}."
+        return f"{surname} {i1}. {i2}."
     return None
 
 
@@ -369,7 +424,7 @@ def detect_lesson_number(row: list, fallback_counter: int) -> int:
             num_str = m.group(1) or m.group(3)
             if num_str:
                 return int(num_str)
-    return min(max(fallback_counter, 1), 8)
+    return min(max(fallback_counter, 1), MAX_LESSON_NUMBER)
 
 
 def _extract_groups_from_text(text: str) -> list:
@@ -475,14 +530,7 @@ def parse_cell_to_lesson(date_str, group, lesson_number, raw_text, warnings):
     cleaned = clean_cell(raw_text)
     cleaned = re.sub(r"^\s*\d{1,2}\.\d{2}\.\d{4}\s*[,.;:|()\-–]*\s*", "", cleaned)
     cleaned = re.sub(r"^\s*\d{4}\.\d{2}\.\d{2}\s*[,.;:|()\-–]*\s*", "", cleaned)
-    cleaned = re.sub(
-        r"^\s*(?:понеділок|вівторок|середа|четвер|п['’]?ятниця|субота|неділя|"
-        r"коніделоп|коротвіВ|адереС|ревтеЧ|яцинтя.П|атобуС|ялідеН)"
-        r"\s*[,.;:|()\-–]*\s*",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
+    cleaned = WEEKDAY_PREFIX_RE.sub("", cleaned)
     cleaned = cleaned.strip()
     if not cleaned:
         return None
@@ -551,7 +599,12 @@ def parse_cell_to_lesson(date_str, group, lesson_number, raw_text, warnings):
     # Never store room/url as teacher
     teacher = normalize_teacher_name(teacher)
 
-    time_start, time_end = BELLS.get(lesson_number, ("00:00", "00:00"))
+    # 9th pair is rare; if it slips through we still want a time, not 00:00.
+    bell = BELLS.get(lesson_number)
+    if bell is None:
+        time_start, time_end = "00:00", "00:00"
+    else:
+        time_start, time_end = bell
     return LessonItem(
         date=date_str,
         group=group,
@@ -709,12 +762,12 @@ def _parse_table(table_obj, fallback_year, warnings):
     return items
 
 
-def _parse_text_fallback(pdf_path, fallback_year, warnings):
+def _parse_text_fallback(source, fallback_year, warnings):
     items = []
     current_date = None
     lesson_counter = 0
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(source) as pdf:
         for page in pdf.pages:
             page_txt = page.extract_text() or ""
             lines = [clean_cell(ln) for ln in page_txt.splitlines() if clean_cell(ln)]
@@ -745,24 +798,46 @@ def _parse_text_fallback(pdf_path, fallback_year, warnings):
                 targets = line_groups if line_groups else active_groups
 
                 if LESSON_TYPE_RE.search(line) or ROOM_RE.search(line) or "," in line:
-                    lesson_counter = min(max(lesson_counter, 1), 8)
+                    lesson_counter = min(max(lesson_counter, 1), MAX_LESSON_NUMBER)
                     for g in targets:
                         item = parse_cell_to_lesson(
                             current_date, g, lesson_counter, line, warnings
                         )
                         if item:
                             items.append(item)
-                    lesson_counter = min(lesson_counter + 1, 8)
+                    lesson_counter = min(lesson_counter + 1, MAX_LESSON_NUMBER)
 
     return items
 
 
-def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
+def _coerce_pdf_source(source, filename: str | None) -> tuple[object, str]:
+    """Normalise the parser input to (pdfplumber-openable, name-hint).
+
+    ``source`` may be a filesystem path (str/Path) or a binary file object
+    (``BytesIO``). ``filename`` is used only to derive the academic year hint
+    when the source has no path; if missing we fall back to an empty string
+    (the year is then inferred from the page text).
+    """
+    if isinstance(source, (str, Path)):
+        return source, os.path.basename(str(source))
+    # File-like object (BytesIO etc.) — pdfplumber accepts it directly.
+    return source, filename or ""
+
+
+def parse_schedule_pdf_detailed(source, filename: str | None = None) -> dict:
+    """Parse a schedule PDF.
+
+    Args:
+        source: a path (``str``/``Path``) or a binary file object (``BytesIO``).
+        filename: original file name hint, used only to infer the academic
+            year when ``source`` is a file object (no path information).
+    """
+    pdf_source, name_hint = _coerce_pdf_source(source, filename)
     results = []
     warnings = []
-    fallback_year = _extract_year_from_filename(pdf_path)
+    fallback_year = _extract_year_from_filename(name_hint)
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_source) as pdf:
         for page in pdf.pages:
             if not fallback_year:
                 page_txt = page.extract_text() or ""
@@ -786,7 +861,7 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
                 results.extend(_parse_table(t_obj, fallback_year, warnings))
 
     if not results:
-        results = _parse_text_fallback(pdf_path, fallback_year, warnings)
+        results = _parse_text_fallback(pdf_source, fallback_year, warnings)
 
     deduped = []
     seen = set()
@@ -818,5 +893,5 @@ def parse_schedule_pdf_detailed(pdf_path: str) -> dict:
     }
 
 
-def parse_schedule_pdf(pdf_path: str) -> list:
-    return parse_schedule_pdf_detailed(pdf_path)["lessons"]
+def parse_schedule_pdf(source, filename: str | None = None) -> list:
+    return parse_schedule_pdf_detailed(source, filename=filename)["lessons"]

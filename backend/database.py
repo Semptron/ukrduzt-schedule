@@ -14,6 +14,7 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
@@ -103,6 +104,11 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_lessons_teacher ON lessons(teacher)"
+        )
+        # Composite index helps the teacher + date query path used by the
+        # /api/v1/schedule?teacher=...&date=... client requests.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lessons_teacher_date ON lessons(teacher, date)"
         )
         conn.commit()
 

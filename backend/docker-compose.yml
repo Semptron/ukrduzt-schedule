@@ -4,24 +4,38 @@ services:
     image: ukrduzt-schedule-api:latest
     container_name: ukrduzt-schedule-api
     restart: unless-stopped
+    # Run as the same uid the image created (10001). With a named volume below
+    # this just works; if you switch back to a bind-mount, create the host
+    # directory with `mkdir -p data downloads && chown -R 10001:10001 data downloads`.
+    user: "10001:10001"
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
+      # Named volumes avoid the host-ownership pitfall: Docker creates them
+      # owned by the container user, so SQLite can always open the file.
+      - schedule-data:/app/data
+      - schedule-downloads:/app/downloads
     environment:
       - PYTHONUNBUFFERED=1
+      # Kyiv time inside the container; mirrored from the Dockerfile ENV but
+      # explicit here so a `docker run` without compose still picks it up.
+      - TZ=Europe/Kyiv
       # Cadence of the background portal sync. Lower it in staging for faster
       # feedback during parser changes; keep 3600 in production.
       - SYNC_INTERVAL_SECONDS=3600
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
-      interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
+      # Set this to a random string in production (e.g. `openssl rand -hex 24`)
+      # and send it as `X-Sync-Token` to gate /api/v1/sync?force=true.
+      # Leave empty to allow open access (dev only).
+      - SYNC_TOKEN=
+      # Comma-separated explicit origins enable credentialed CORS. Default "*"
+      # is permissive but disables credentials (per the CORS spec).
+      - CORS_ALLOW_ORIGINS=*
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  schedule-data:
+  schedule-downloads:

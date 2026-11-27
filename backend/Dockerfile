@@ -19,9 +19,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ---- Runtime stage: small image, no compiler, non-root ----------------------
 FROM python:3.12-slim AS runtime
 
-# curl is needed for the HEALTHCHECK below.
+# curl is needed for the HEALTHCHECK below; tzdata lets us honour
+# TZ=Europe/Kyiv so date inference near New Year's matches the portal, not UTC.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl tzdata \
+ && ln -fs /usr/share/zoneinfo/Europe/Kyiv /etc/localtime \
+ && echo "Europe/Kyiv" > /etc/timezone \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user: if the API has a bug, it can't write outside /app/data.
@@ -37,9 +40,12 @@ COPY --chown=app:app . .
 # Runtime data goes here (mounted as a volume in compose).
 RUN mkdir -p /app/data /app/downloads && chown -R app:app /app/data /app/downloads
 
+# Force Kyiv time inside the container regardless of host TZ. Without this
+# the parser's _infer_year_for_month drifts around New Year (UTC vs Kyiv+2).
 ENV PATH=/home/app/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Europe/Kyiv
 
 USER app
 

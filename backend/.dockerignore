@@ -21,6 +21,9 @@ downloads/
 *.md
 LICENSE
 tests/
+# requirements.txt is consumed in the builder stage; the runtime stage does
+# not need it (deps are already copied from /root/.local).
+requirements.txt
 
 # Editor / OS noise
 .DS_Store
