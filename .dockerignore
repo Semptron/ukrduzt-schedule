@@ -1,0 +1,45 @@
+# Root-level .dockerignore for the Render fallback Dockerfile.
+#
+# The fallback Dockerfile does `COPY backend/ .` (after pulling deps from
+# backend/requirements.txt). Without this file, that COPY would also pull the
+# Flutter app, docs, the GitHub workflows, and local Python caches into the
+# image — none of which belong in the runtime image. This mirrors
+# backend/.dockerignore but is anchored at the repo root.
+
+# VCS + CI
+.git
+.gitignore
+.github
+
+# Flutter app — not part of the API image
+flutter/
+
+# Docs
+docs/
+*.md
+LICENSE
+
+# Python caches & venvs (in case any exist under backend/)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+
+# Local runtime data — must NOT be baked into the image
+backend/data/
+backend/downloads/
+
+# Tests are dev-only; the runtime stage of backend/Dockerfile ignores them too
+backend/tests/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Render itself
+render.yaml

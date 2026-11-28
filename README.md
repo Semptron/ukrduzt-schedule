@@ -35,6 +35,34 @@ docker compose up -d --build
 mkdir -p data downloads && sudo chown -R 10001:10001 data downloads
 ```
 
+## Деплой на Render
+
+У репозиторії є `render.yaml` (Blueprint) з `rootDir: backend/`. Render читає
+цей файл на корені й використовує `rootDir` як **build context** для
+`backend/Dockerfile` — саме це потрібно, бо `Dockerfile` і `requirements.txt`
+лежать у `backend/`, а не в корені.
+
+### Якщо бачите помилку `"/requirements.txt": not found`
+
+Це означає, що Render бере контекстом **корінь репозиторію**, а не `backend/`.
+Типові причини та виправлення (будь-яке з них підходить, краще перше):
+
+1. **Залиште сервіс як є і дайте Render перечитати `render.yaml`.** У дашборді:
+   *Manual Deploy → Deploy latest commit*, або пушніть коміт із `render.yaml`.
+   `rootDir: backend/` у коді має пріоритет над полем *Root Directory* у
+   дашборді й застосовується на кожному деплої — навіть після ручного
+   «Base directory updated».
+2. **У дашборді: Service → Settings → *Root Directory* = `backend/`** (без
+   слешу в кінці), потім *Save* → *Manual Deploy*. Це ручний дубль до `render.yaml`.
+3. **Якщо з будь-якої причини контекстом лишається корінь** — є запасний
+   кореневий `Dockerfile` + кореневий `requirements.txt` (копія `backend/`).
+   Тоді *Dockerfile Path* у дашборді = `Dockerfile` (корінь) — і збірка теж
+   проходить, бо цей Dockerfile робить `COPY backend/requirements.txt` та
+   `COPY backend/ .`.
+
+Рекомендований шлях — `render.yaml` (версіонований, не залежить від
+налаштувань дашборду). Запасний `Dockerfile` лишено як страхову сітку.
+
 ### Змінні середовища
 
 | Змінна | За замовч. | Призначення |

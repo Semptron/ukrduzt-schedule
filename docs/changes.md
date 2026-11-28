@@ -421,6 +421,45 @@ PDF скопійовано у `tests/fixtures/` (143 КБ), тож тест не
 - `kScheduleSourcePrefsKey` версіонований.
 - Побудова URL-ів з `&source=` парситься коректно.
 
+## Виправлення деплою на Render (`COPY requirements.txt: not found`)
+
+### 38. render.yaml з rootDir: backend/
+**Файл:** `render.yaml` (новий, корінь репозиторію)
+
+Скріншот деплою показав, що збірка падає на кроці
+`[builder 3/4] COPY requirements.txt` з помилкою
+`"/requirements.txt": not found` після ручного тригеру «Base directory updated».
+Причина: `Dockerfile` та `requirements.txt` лежать у `backend/`, а Render брав
+контекстом корінь репозиторію — інструкція `COPY requirements.txt .` не знаходила
+файл.
+
+Виправлення: `render.yaml` (Render Blueprint) на корені з
+`rootDir: backend/` + `dockerfilePath: ./Dockerfile`. Render читає цей файл на
+кожному деплої, і `rootDir` має пріоритет над полем *Root Directory* у
+дашборді — отже ручні зміни «Base directory» більше не ламають збірку. Додано
+`healthCheckPath: /health`, `autoDeploy: true` та оточення (`TZ=Europe/Kyiv`,
+`SYNC_INTERVAL_SECONDS=3600`).
+
+### 39. Кореневий fallback Dockerfile + requirements.txt + .dockerignore
+**Файли:** `Dockerfile` (новий, корінь), `requirements.txt` (копія `backend/`),
+`.dockerignore` (новий, корінь)
+
+Страхова сітка на випадок, якщо Render проігнорує `render.yaml` або в
+дашборді *Dockerfile Path* жорстко вказано на корінь. Кореневий Dockerfile
+робить `COPY backend/requirements.txt .` (deps) та `COPY backend/ .` (код),
+тому збірка проходить з контекстом-коренем теж — те саме `uvicorn main:app`,
+ти ж самі ENV/HEALTHCHECK/користувач 10001, що й у `backend/Dockerfile`.
+
+`.dockerignore` на корені не дає `COPY backend/ .` затягнути `flutter/`,
+`docs/`, `.github/`, `tests/`, кеші та локальні `data/` у runtime-образ.
+
+### 40. README: розділ «Деплой на Render»
+**Файл:** `README.md`
+
+Описано три шляхи виправлення помилки `requirements.txt: not found`
+(`render.yaml` → ручний Root Directory → кореневий fallback Dockerfile) і чому
+`rootDir: backend/` потрібен.
+
 ## Підсумок тестів
 
 | Середовище | Було | Стало |
@@ -428,3 +467,4 @@ PDF скопійовано у `tests/fixtures/` (143 КБ), тож тест не
 | Backend pytest | 47 passed | 55 passed (+1 real-PDF, +7 source-filter) |
 | Flutter test | 18 | 25 (+7 source-toggle) |
 | Dart analyze | 0 errors | 0 errors / 0 warnings |
+| Docker build | n/a | обидва Dockerfile верифіковано (цілі COPY існують) |
