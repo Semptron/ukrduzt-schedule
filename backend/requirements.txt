@@ -1,7 +1,7 @@
 # Pinned with upper bounds: FastAPI/Starlette occasionally break across
 # minor releases, and a free-floating >= would let CI silently break on us.
-fastapi>=0.115.0,<0.120
-uvicorn[standard]>=0.30.0,<0.35
+fastapi>=0.165.0,<0.166
+uvicorn[standard]>=0.54.0,<0.55
 # python-multipart is required by FastAPI's UploadFile / Form handling
 # (used by the manual schedule upload endpoint).
 python-multipart>=0.0.9,<0.1
