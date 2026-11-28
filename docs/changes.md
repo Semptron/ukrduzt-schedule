@@ -268,10 +268,163 @@ editor noise.
 FastAPI інжектить `Response`. Залишено `= None` для зворотної сумісності з
 викликами поза FastAPI, але в_RUNTIME_ FastAPI завжди передає об'єкт.
 
+
+## Ручне завантаження розкладу (нова функція)
+
+### 26. Модель «ручне vs портал» у БД
+**Файл:** `backend/database.py`
+
+Сценарій: на сайті один розклад, але куратор скинув інший. Рішення — окреме
+джерело `source_type='manual'`, що **переважає** над порталом для тих самих
+(дата, група, номер пари). Інші портальні пари (для яких ручного запису немає)
+залишаються доступними.
+
+- Колонки `lessons.source_type` (`'portal'`/`'manual'`) та `lessons.source_name`.
+- Таблиця `manual_files` (id, original_name, sha256, lesson_count,
+  warnings_count, uploaded_at, note).
+- Міграція для існуючих БД: `ALTER TABLE lessons ADD COLUMN source_type ...`
+  через інтроспекцію `PRAGMA table_info` (SQLite не має `IF NOT EXISTS` для
+  `ADD COLUMN`).
+- `query_lessons` тепер дедуплікує: якщо (date, group, lesson_number) є в обох
+  джерелах, повертає лише `manual`. Це зроблено у Python (після SQL-фільтра),
+  бо дедуп-ключ — складений, а сортування вже групує рядки разом.
+
+### 27. API ручного завантаження
+**Файл:** `backend/main.py`
+
+- `POST /api/v1/admin/upload` (multipart, поле `file` + необов'язкове `note`):
+  валідує розширення (.pdf), magic bytes (`%PDF-`), розмір (≤20 МБ), парсить
+  in-memory через `BytesIO` (без temp-файлу, як і скрапер), зберігає через
+  `add_manual_file`. Якщо парсер знайшов 0 пар — 422 з людським повідомленням.
+- `GET /api/v1/admin/uploads` — список завантажених файлів.
+- `DELETE /api/v1/admin/uploads/{manual_id}` — видалити файл і його пари;
+  для тих дат знову стає актуальним розклад з порталу.
+- Усі три ендпойнти gated `X-Sync-Token` (якщо `SYNC_TOKEN` встановлено) через
+  спільну `_require_sync_token` — той самий механізм що й для `force=true` sync.
+
+### 28. Залежність `python-multipart`
+**Файл:** `backend/requirements.txt`
+
+Додано `python-multipart>=0.0.9,<0.1` — потрібен FastAPI `UploadFile`/`Form`.
+
+### 29. Flutter-екран «Додати файл»
+**Файл:** `flutter/manual_upload_screen.dart`, `flutter/main.dart`
+
+- Нова вкладка в `NavigationBar` (3 пункти: Розклад / Викладачі / Додати файл).
+- `file_picker` для вибору PDF з пристрою; `MultipartFile` для завантаження на
+  `/api/v1/admin/upload`. Опціональне поле помітки.
+- Токен `X-Sync-Token` зберігається в SharedPreferences (ключ
+  `ukrduzt_sync_token_v1`), щоб не перепитувати щоразу.
+- Список уже завантажених файлів з можливістю видалити (підтвердження діалогом).
+- `pubspec_dependencies_snippet.txt` доповнено `file_picker: ^8.1.2` і
+  `http_parser: ^4.0.2`.
+
+### 30. Тести ручного завантаження
+**Файл:** `backend/tests/test_main.py`, `flutter/test/manual_upload_test.dart`
+
+Backend (+7):
+- `test_upload_rejects_non_pdf` — .txt → 400.
+- `test_upload_rejects_pdf_named_but_not_pdf` — .pdf без magic bytes → 400.
+- `test_upload_requires_token_when_set` — без токена → 403.
+- `test_upload_accepts_pdf_without_token` — без SYNC_TOKEN → 201.
+- `test_upload_then_list_then_delete` — повний цикл + 404 на повторне видалення.
+- `test_list_uploads_requires_token_when_set` — 403 без токена, 200 з ним.
+- `test_manual_overrides_portal_in_query` — головний: seed portal → upload
+  manual з тим самим ключем → query повертає лише manual → delete manual →
+  portal повертається. Фікстура `_isolated_db` вказує `database.DB_PATH` на
+  tmp_path, тести не ламають реальну БД.
+
+Flutter (+5):
+- `ManualUploadEntry.fromJson` — повний розбір + толерантність до відсутніх
+  полів + null note.
+- `UploadResult.ok` / `UploadResult.error` — поля та повідомлення.
+
+### 31. Структура тестового PDF
+Backend-тести будують валідний PDF «з частин»: ASCII-контент (Helvetica без
+кирилиці) + багаторядковий текст, щоб pdfplumber витягнув `101-LLG-326 /
+24.11.2026 / 1 / Math 2.123`. `GROUP_RE` та `ROOM_RE` матчать латинські коди,
+тому тести не залежать від кириличних шрифтів у CI.
+
+## Перевірка парсера на реальному кураторському PDF
+
+### 32. Тест на файлі «МЕХ 1 курс 24.11-02.12.2026.pdf»
+**Файл:** `backend/tests/test_parser.py` (+ `tests/fixtures/meh_1kurs_24.11-02.12.2026.pdf`)
+
+Реальний PDF, який куратор скидає студентам. У ньому pdfplumber витягує текст
+**праворуч-ліворуч**: дати як `6202.11.42` (→ `24.11.2026`), дні тижня як
+`коротвіВ` (→ `Вівторок`). Парсер вже мав реверс-обробку (`REVERSED_DATE_RE`,
+`_WEEKDAYS` з реверсними формами), тож **допрацьовувати parser.py не довелось** —
+це підтверджено тестом:
+
+- 106 пар, 0 попереджень, 0 пар без кімнати/типу.
+- 9 дат: 24.11–30.11.2026 + 01.12–02.12.2026.
+- 4 групи: `101-ЛЛГ-з26`, `102-ВТІ-з26`, `103-ЕРТ-з26`, `104-ТЕ-з26`.
+- 8 викладачів: Бабенко А. О., Сніжко І. А., Осмаєв О. А., Казанко О. В.,
+  Катковнікова Л. А., Панчук О. В., Семененко О. І., Ананьєва О.
+
+PDF скопійовано у `tests/fixtures/` (143 КБ), тож тест не залежить від
+`upload/` і працює у CI.
+
+## Перемикач «Розділ 1 портал / Розділ 2 офлайн»
+
+### 33. Фільтр `source_type` у database.py
+**Файл:** `backend/database.py`
+
+`list_groups(source_type=...)`, `list_teachers(source_type=...)` та
+`query_lessons(..., source_type=...)` приймають `'portal'` / `'manual'` /
+`None`/`'all'`. Для одного джерела додається `WHERE source_type = ?` і
+**пропускається** дедуплікація manual>portal (бо тініцювати нічого). Для `all`
+залишається попередня логіка (manual переважає над portal).
+
+### 34. Параметр `?source` у main.py
+**Файл:** `backend/main.py`
+
+`/api/v1/groups`, `/api/v1/teachers`, `/api/v1/schedule` отримують query-параметр
+`source` з `pattern="^(portal|manual|all)$"` (422 на невірне значення). Відповіді
+доповнено `Vary: source`, щоб кеш-проксі не змішували відповіді різних режимів.
+
+### 35. Flutter-перемикач
+**Файли:** `flutter/api_config.dart`, `flutter/schedule_screen.dart`, `flutter/teacher_search_screen.dart`
+
+- `api_config.dart`: enum `ScheduleSource { portal, manual, all }` + функція
+  `sourceQueryValue(ScheduleSource) → String`.
+- Обидва екрани отримали `SegmentedButton` з трьома сегментами (Розділ 1 /
+  Розділ 2 / Усі) у верхі body.
+- Вибір зберігається в `SharedPreferences` (`ukrduzt_schedule_source_v1`),
+  синхронізується між екранами: при перемиканні скидаються групи/результати та
+  перевантажується список (в офлайн-режимі набір груп/викладачів інший).
+- У режимі `manual` список викладачів не змішується з локальним кешем (бо кеш
+  належить портальним групам — інакше портальні викладачі «втікали» б в офлайн).
+
+### 36. Backend-тести фільтрації
+**Файл:** `backend/tests/test_main.py` (+8)
+
+- `test_list_groups_filters_by_source`, `test_list_teachers_filters_by_source`
+  — portal/manual/all розрізняються.
+- `test_query_lessons_source_manual_skips_dedup` — у режимі manual для спільної
+  групи повертається лише ручний запис (без портального, без дедупу).
+- `test_query_lessons_source_portal_returns_portal_only` — симетрично.
+- `test_query_lessons_source_all_dedups_manual_over_portal` — дефолт зберігає
+  перевагу manual.
+- `test_groups_endpoint_source_filter` — HTTP 422 на `?source=bogus`, 200 з
+  валідним, різні набори груп.
+- `test_schedule_endpoint_source_filter` — `/schedule?...&source=manual`
+  повертає лише manual-предмет для спільної (дата, група, пара).
+- Допоміжна `_seed_two_sources()` сіє portal-only + manual-only + спільну
+  групу, щоб фільтри мали що ділити.
+
+### 37. Flutter-тести перемикача
+**Файл:** `flutter/test/source_toggle_test.dart` (+7)
+
+- `sourceQueryValue` відображає enum → рядок запиту.
+- Enum має рівно 3 значення, імена стабільні (для prefs-сумісності).
+- `kScheduleSourcePrefsKey` версіонований.
+- Побудова URL-ів з `&source=` парситься коректно.
+
 ## Підсумок тестів
 
 | Середовище | Було | Стало |
 |---|---|---|
-| Backend pytest | 26 passed | 40 passed |
-| Flutter test | 1 (smoke) | 13 (12 unit + smoke) |
-| Dart analyze | n/a | 0 issues |
+| Backend pytest | 47 passed | 55 passed (+1 real-PDF, +7 source-filter) |
+| Flutter test | 18 | 25 (+7 source-toggle) |
+| Dart analyze | 0 errors | 0 errors / 0 warnings |

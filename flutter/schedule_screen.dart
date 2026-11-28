@@ -6,7 +6,14 @@ import 'package:http/http.dart' as http;
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'api_config.dart' show kApiBaseUrl, kHttpHeaders, kMetadataTimeout, kScheduleTimeout;
+import 'api_config.dart'
+    show
+        kApiBaseUrl,
+        kHttpHeaders,
+        kMetadataTimeout,
+        kScheduleTimeout,
+        ScheduleSource,
+        sourceQueryValue;
 
 const String kMoodleUrl = 'https://do.kart.edu.ua/';
 const String kZoomAppUrl = 'https://zoom.us/join';
@@ -14,6 +21,9 @@ const String kMeetingsPrefsKey = 'ukrduzt_zoom_configs_v1';
 const String kNotesPrefsKey = 'ukrduzt_lesson_notes_v1';
 const String kSelectedGroupPrefsKey = 'ukrduzt_selected_group_v1';
 const String kGroupsCachePrefsKey = 'ukrduzt_groups_cache_v2';
+/// Persisted schedule source so the user keeps "Розділ 2 — офлайн" after a
+/// restart. Stored as the ScheduleSource name (portal/manual/all).
+const String kScheduleSourcePrefsKey = 'ukrduzt_schedule_source_v1';
 
 /// "Today" is the portal's today (Europe/Kyiv), not the device's today.
 /// A student abroad on a phone set to local time would otherwise see the
@@ -267,6 +277,9 @@ class _ScheduleScreenState extends State<ScheduleScreen>
   bool _showAllDates = false;
   List<String> _groups = [];
   List<LessonModel> _lessons = [];
+  /// Which source the user is browsing: portal (Розділ 1), manual/offline
+  /// (Розділ 2 — завантажений куратором файл), or all. Persisted in prefs.
+  ScheduleSource _source = ScheduleSource.all;
   Map<String, ZoomAccessConfig> _zoomConfigs = {};
   Map<String, String> _lessonNotes = {};
   bool _loading = true;
@@ -325,6 +338,17 @@ class _ScheduleScreenState extends State<ScheduleScreen>
         savedGroup.isNotEmpty &&
         _isValidGroupName(savedGroup)) {
       _selectedGroup = savedGroup.trim();
+    }
+
+    // Restore the schedule source toggle (Розділ 1 портал / Розділ 2 офлайн).
+    final savedSource = prefs.getString(kScheduleSourcePrefsKey);
+    if (savedSource != null) {
+      for (final s in ScheduleSource.values) {
+        if (s.name == savedSource) {
+          _source = s;
+          break;
+        }
+      }
     }
 
     final rawMeetings = prefs.getString(kMeetingsPrefsKey);
@@ -487,7 +511,9 @@ class _ScheduleScreenState extends State<ScheduleScreen>
 
   Future<void> _fetchGroups(SharedPreferences prefs) async {
     try {
-      final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/groups');
+      final uri = Uri.parse(
+        '${widget.apiBaseUrl}/api/v1/groups?source=${sourceQueryValue(_source)}',
+      );
       final resp = await http.get(uri, headers: kHttpHeaders)
           .timeout(kMetadataTimeout);
       if (resp.statusCode != 200 || !mounted) return;
@@ -524,6 +550,28 @@ class _ScheduleScreenState extends State<ScheduleScreen>
     }
   }
 
+  /// Switch the schedule source (Розділ 1 портал / Розділ 2 офлайн / усі).
+  /// Persisted in prefs so it survives a restart, and re-fetches both the
+  /// group list and the current group's lessons — the manual source has a
+  /// different set of groups/teachers than the portal, so the lists must be
+  /// rebuilt or the dropdown would show groups that have no lessons here.
+  Future<void> _changeSource(ScheduleSource next) async {
+    if (next == _source) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kScheduleSourcePrefsKey, next.name);
+    setState(() {
+      _source = next;
+      _loading = true;
+      _error = null;
+      _lessons = [];
+      _selectedDate = null;
+      // Drop the cached group list — it's source-specific.
+      _groups = [];
+    });
+    await _fetchGroups(prefs);
+    await _fetchSchedule(prefs, showSpinnerIfEmpty: true);
+  }
+
   Future<void> _fetchSchedule(
     SharedPreferences? prefs, {
     bool showSpinnerIfEmpty = true,
@@ -554,7 +602,8 @@ class _ScheduleScreenState extends State<ScheduleScreen>
 
       try {
         final uri = Uri.parse(
-          '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}',
+          '${widget.apiBaseUrl}/api/v1/schedule?group=${Uri.encodeComponent(targetGroup)}'
+          '&source=${sourceQueryValue(_source)}',
         );
         final resp = await http.get(uri, headers: kHttpHeaders)
             .timeout(kScheduleTimeout);
@@ -1098,6 +1147,48 @@ class _ScheduleScreenState extends State<ScheduleScreen>
       ),
       body: Column(
         children: [
+          // Розділ 1 (портал) / Розділ 2 (офлайн — завантажений куратором) /
+          // усі (manual переважає над portal). Перемикання перевантажує і
+          // список груп, і розклад, бо в кожного джерела свій набір груп.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: SegmentedButton<ScheduleSource>(
+              segments: const [
+                ButtonSegment(
+                  value: ScheduleSource.portal,
+                  label: Text('Розділ 1'),
+                  icon: Icon(Icons.public, size: 18),
+                ),
+                ButtonSegment(
+                  value: ScheduleSource.manual,
+                  label: Text('Розділ 2'),
+                  icon: Icon(Icons.offline_share_outlined, size: 18),
+                ),
+                ButtonSegment(
+                  value: ScheduleSource.all,
+                  label: Text('Усі'),
+                  icon: Icon(Icons.layers_outlined, size: 18),
+                ),
+              ],
+              selected: {_source},
+              onSelectionChanged: (sel) {
+                if (sel.isNotEmpty) _changeSource(sel.first);
+              },
+              showSelectedIcon: false,
+            ),
+          ),
+          if (_source == ScheduleSource.manual)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Офлайн: лише завантажені куратором файли. Групи та '
+                  'викладачі беруться з них, а не з порталу.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ),
           if (_offlineBanner)
             Container(
               width: double.infinity,

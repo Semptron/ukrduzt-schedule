@@ -159,3 +159,49 @@ def test_normalize_teacher_name_swaps_reversed_initials():
 def test_normalize_teacher_name_keeps_standard_form():
     assert normalize_teacher_name("Бабенко А. О.") == "Бабенко А. О."
     assert normalize_teacher_name("Панчук О.В.") == "Панчук О. В."
+
+
+# ---------------------------------------------------------------------------
+# Real-world PDF fixture
+# ---------------------------------------------------------------------------
+# A curator-uploaded schedule ("МЕХ 1 курс 24.11-02.12.2026.pdf") whose text is
+# extracted right-to-left by pdfplumber: dates like "6202.11.42" → 24.11.2026
+# and weekdays like "коротвіВ" → Вівторок. This guards the parser's reversed-
+# text handling against regressions on the exact file a curator would send.
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "meh_1kurs_24.11-02.12.2026.pdf"
+
+
+def test_parse_real_curator_pdf_extracts_all_dates_and_groups():
+    """The real МЕХ 1 курс PDF parses cleanly: 9 dates, 4 groups, 8 teachers,
+    106 lessons, 0 warnings, and every lesson has a room."""
+    bundle = parse_schedule_pdf_detailed(_FIXTURE)
+    lessons = bundle["lessons"]
+    warnings = bundle["warnings"]
+
+    # 9 weekdays × 1 page, 4 groups, mostly 5-7 pairs per day per group.
+    assert len(lessons) == 106, f"expected 106 lessons, got {len(lessons)}"
+    assert warnings == [], f"unexpected warnings: {warnings}"
+
+    dates = sorted({l["date"] for l in lessons})
+    assert dates == [
+        "01.12.2026", "02.12.2026",
+        "24.11.2026", "25.11.2026", "26.11.2026",
+        "27.11.2026", "28.11.2026", "29.11.2026", "30.11.2026",
+    ], dates
+
+    groups = sorted({l["group"] for l in lessons})
+    assert groups == [
+        "101-ЛЛГ-з26", "102-ВТІ-з26", "103-ЕРТ-з26", "104-ТЕ-з26",
+    ], groups
+
+    teachers = sorted({l["teacher"] for l in lessons if l["teacher"]})
+    assert "Бабенко А. О." in teachers
+    assert "Сніжко І. А." in teachers
+    assert "Осмаєв О. А." in teachers
+    assert "Казанко О. В." in teachers
+    assert len(teachers) == 8, teachers
+
+    # Every lesson must have a room and a lesson type on this file.
+    assert all(l["room"] for l in lessons), "some lessons lost their room"
+    assert all(l["lesson_type"] for l in lessons), "some lessons lost their type"

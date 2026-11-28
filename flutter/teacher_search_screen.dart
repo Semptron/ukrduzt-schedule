@@ -4,7 +4,14 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'api_config.dart' show kApiBaseUrl, kHttpHeaders, kMetadataTimeout, kScheduleTimeout;
+import 'api_config.dart'
+    show
+        kApiBaseUrl,
+        kHttpHeaders,
+        kMetadataTimeout,
+        kScheduleTimeout,
+        ScheduleSource,
+        sourceQueryValue;
 import 'schedule_screen.dart';
 
 
@@ -47,6 +54,11 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
   bool _searching = false;
   String? _error;
   int _searchSeq = 0;
+  /// Same source toggle as the schedule screen (Розділ 1 портал / Розділ 2
+  /// офлайн / усі). Kept in sync with the schedule screen via the shared prefs
+  /// key, so a teacher search in "офлайн" mode only sees curator-uploaded
+  /// teachers.
+  ScheduleSource _source = ScheduleSource.all;
 
   @override
   void initState() {
@@ -59,10 +71,42 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
   void didUpdateWidget(covariant TeacherSearchScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
     // When the user switches back to this tab, re-read Zoom overrides that may
-    // have been added on the schedule tab meanwhile.
+    // have been added on the schedule tab meanwhile, and re-sync the source
+    // toggle in case it changed on the schedule tab.
     if (!oldWidget.isActive && widget.isActive) {
       _refreshZoomConfigs();
+      _reloadSourceFromPrefs();
     }
+  }
+
+  Future<void> _reloadSourceFromPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(kScheduleSourcePrefsKey);
+    if (saved == null) return;
+    ScheduleSource? next;
+    for (final s in ScheduleSource.values) {
+      if (s.name == saved) {
+        next = s;
+        break;
+      }
+    }
+    final resolved = next;
+    if (resolved != null && resolved != _source && mounted) {
+      setState(() => _source = resolved);
+      await _fetchTeachers();
+    }
+  }
+
+  Future<void> _changeSource(ScheduleSource next) async {
+    if (next == _source) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kScheduleSourcePrefsKey, next.name);
+    setState(() {
+      _source = next;
+      _results = [];
+      _error = null;
+    });
+    await _fetchTeachers();
   }
 
   @override
@@ -117,6 +161,17 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
   Future<void> _loadLocalZoomAndTeachers() async {
     final prefs = await SharedPreferences.getInstance();
 
+    // Restore the source toggle (shared with the schedule screen).
+    final savedSource = prefs.getString(kScheduleSourcePrefsKey);
+    if (savedSource != null) {
+      for (final s in ScheduleSource.values) {
+        if (s.name == savedSource) {
+          _source = s;
+          break;
+        }
+      }
+    }
+
     final rawMeetings = prefs.getString(kMeetingsPrefsKey);
     if (rawMeetings != null && rawMeetings.isNotEmpty) {
       try {
@@ -130,6 +185,11 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
       } catch (_) {}
     }
 
+    await _fetchTeachers();
+  }
+
+  Future<void> _fetchTeachers() async {
+    final prefs = await SharedPreferences.getInstance();
     final cachedLessons = _collectCachedLessons(prefs);
     final localTeachers = <String>{};
     for (final lesson in cachedLessons) {
@@ -145,7 +205,9 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
     }
 
     try {
-      final uri = Uri.parse('${widget.apiBaseUrl}/api/v1/teachers');
+      final uri = Uri.parse(
+        '${widget.apiBaseUrl}/api/v1/teachers?source=${sourceQueryValue(_source)}',
+      );
       final resp = await http.get(uri, headers: kHttpHeaders).timeout(kMetadataTimeout);
       if (resp.statusCode == 200 && mounted) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
@@ -153,7 +215,13 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
             .map((e) => e.toString().trim())
             .where((e) => e.isNotEmpty)
             .toSet();
-        apiTeachers.addAll(localTeachers);
+        // In offline (manual) mode the cached lessons belong to portal groups,
+        // so mixing them in would leak portal-only teachers into the offline
+        // list. Only merge the local cache when the user is in 'all' or
+        // 'portal' mode.
+        if (_source != ScheduleSource.manual) {
+          apiTeachers.addAll(localTeachers);
+        }
         final filtered = apiTeachers.where(_looksLikeTeacher).toList()..sort();
         setState(() => _allTeachers = filtered);
       }
@@ -179,7 +247,8 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
 
     try {
       final uri = Uri.parse(
-        '${widget.apiBaseUrl}/api/v1/schedule?teacher=${Uri.encodeComponent(cleaned)}',
+        '${widget.apiBaseUrl}/api/v1/schedule?teacher=${Uri.encodeComponent(cleaned)}'
+        '&source=${sourceQueryValue(_source)}',
       );
       final resp = await http.get(uri, headers: kHttpHeaders).timeout(kScheduleTimeout);
       if (!mounted || seq != _searchSeq) return;
@@ -301,6 +370,36 @@ class _TeacherSearchScreenState extends State<TeacherSearchScreen>
       ),
       body: Column(
         children: [
+          // Same source toggle as the schedule tab. In "Розділ 2" (офлайн)
+          // the teacher list and search are restricted to curator-uploaded
+          // files, so a teacher who only appears on the portal won't show.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: SegmentedButton<ScheduleSource>(
+              segments: const [
+                ButtonSegment(
+                  value: ScheduleSource.portal,
+                  label: Text('Розділ 1'),
+                  icon: Icon(Icons.public, size: 18),
+                ),
+                ButtonSegment(
+                  value: ScheduleSource.manual,
+                  label: Text('Розділ 2'),
+                  icon: Icon(Icons.offline_share_outlined, size: 18),
+                ),
+                ButtonSegment(
+                  value: ScheduleSource.all,
+                  label: Text('Усі'),
+                  icon: Icon(Icons.layers_outlined, size: 18),
+                ),
+              ],
+              selected: {_source},
+              onSelectionChanged: (sel) {
+                if (sel.isNotEmpty) _changeSource(sel.first);
+              },
+              showSelectedIcon: false,
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
             child: TextField(

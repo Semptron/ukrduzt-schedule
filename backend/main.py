@@ -20,26 +20,41 @@ Concurrency model:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from database import (
+    add_manual_file,
+    delete_manual_file,
     get_recent_changes,
     init_db,
     list_groups,
+    list_manual_files,
     list_teachers,
     query_lessons,
 )
-from parser import BELLS
-from scraper import run_sync
+from parser import BELLS, parse_schedule_pdf_detailed
+from quality import sanitize_lessons
+from scraper import run_sync, sha256_bytes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ukrduzt-backend")
@@ -221,16 +236,34 @@ def get_bells():
 
 
 @app.get("/api/v1/groups")
-def get_groups(response: Response):
-    # Groups change slowly — let caches hold them for a minute.
+def get_groups(
+    response: Response,
+    source: str | None = Query(
+        default=None,
+        description="Фільтр джерела: 'portal' (сайт), 'manual' (завантажений "
+        "куратором файл) або пропущено/'all' (обидва).",
+        pattern="^(portal|manual|all)$",
+    ),
+):
+    # Groups change slowly — let caches hold them for a minute. The source
+    # filter is part of the response identity, so vary the cache by it.
     response.headers["Cache-Control"] = "public, max-age=60"
-    return {"groups": list_groups()}
+    response.headers["Vary"] = "source"
+    return {"groups": list_groups(source_type=source)}
 
 
 @app.get("/api/v1/teachers")
-def get_teachers(response: Response):
+def get_teachers(
+    response: Response,
+    source: str | None = Query(
+        default=None,
+        description="Фільтр джерела, як у /api/v1/groups.",
+        pattern="^(portal|manual|all)$",
+    ),
+):
     response.headers["Cache-Control"] = "public, max-age=60"
-    return {"teachers": list_teachers()}
+    response.headers["Vary"] = "source"
+    return {"teachers": list_teachers(source_type=source)}
 
 
 @app.get("/api/v1/stats")
@@ -278,6 +311,13 @@ def get_schedule(
     group: str | None = Query(None, description="Точна назва групи, напр. 101-ЛЛГ-з26"),
     teacher: str | None = Query(None, description="Частина ПІБ викладача"),
     date: str | None = Query(None, description="Формат ДД.ММ.РРРР"),
+    source: str | None = Query(
+        None,
+        description="Фільтр джерела: 'portal' (сайт), 'manual' (завантажений "
+        "куратором) або пропущено/'all' (обидва, manual переважає над portal "
+        "для тих самих дат і груп).",
+        pattern="^(portal|manual|all)$",
+    ),
     response: Response = None,
 ):
     clean_group = _normalize_query_text(group)
@@ -293,6 +333,7 @@ def get_schedule(
         group=clean_group,
         teacher=clean_teacher,
         date=clean_date,
+        source_type=source,
     )
 
     if not items:
@@ -378,3 +419,164 @@ def trigger_sync(
             "last_error": _last_sync_error,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual schedule upload — "the curator sent a different schedule"
+# ---------------------------------------------------------------------------
+# The portal sometimes disagrees with what a group's curator actually sends
+# out. This lets a trusted user upload that PDF; its rows are tagged
+# source_type='manual' and override the portal rows for the same
+# (date, group, lesson_number) in query_lessons. The endpoints reuse the
+# SYNC_TOKEN gate so a random visitor can't poison the database.
+
+# Hard cap on upload size — schedule PDFs are well under this, and the cap
+# stops a malicious upload from OOMing the parser.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+ALLOWED_UPLOAD_EXTS = {".pdf"}
+
+
+def _require_sync_token(token: str | None) -> None:
+    """Reject the request if SYNC_TOKEN is set and the provided token is wrong.
+
+    Upload mutates the DB, so we gate it the same way as a forced sync: if the
+    operator set SYNC_TOKEN, the request must carry a matching X-Sync-Token.
+    Without this, any visitor could push a bogus PDF and shadow the real
+    schedule for every group it touches.
+    """
+    if not SYNC_TOKEN:
+        return
+    provided = (token or "").strip()
+    if not provided or provided != SYNC_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Завантаження розкладу вимагає дійсного X-Sync-Token",
+        )
+
+
+@app.post("/api/v1/admin/upload")
+async def upload_manual_schedule(
+    file: UploadFile = File(..., description="PDF-файл розкладу від куратора"),
+    note: str | None = Form(
+        default=None,
+        description="Необов'язкова помітка, напр. 'розклад від 24.11 від куратора'",
+    ),
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+):
+    """Parse and persist a curator-uploaded schedule PDF.
+
+    The uploaded file is parsed in-memory (no temp file on disk) and stored as
+    source_type='manual'. Its rows override the portal's for the same
+    (date, group, lesson_number). Re-uploading a file with the same content is
+    safe — it creates a new manual entry (idempotent at the lesson level via
+    the source_url key).
+
+    Requires ``X-Sync-Token`` when ``SYNC_TOKEN`` is configured.
+    """
+    _require_sync_token(x_sync_token)
+
+    # --- validate extension & size ----------------------------------------
+    original_name = (file.filename or "manual.pdf").strip()
+    lower = original_name.lower()
+    if not any(lower.endswith(ext) for ext in ALLOWED_UPLOAD_EXTS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Підтримуються лише PDF-файли (.pdf)",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Файл порожній",
+        )
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Файл занадто великий (макс. {MAX_UPLOAD_BYTES // (1024*1024)} МБ)",
+        )
+    # Reject anything that doesn't smell like a PDF, even with a .pdf name —
+    # a renamed .exe or .png would crash pdfplumber with a confusing error.
+    if not raw[:8].startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Файл не є коректним PDF (відсутній заголовок %PDF-)",
+        )
+
+    # --- parse in memory --------------------------------------------------
+    try:
+        bundle = parse_schedule_pdf_detailed(io.BytesIO(raw), filename=original_name)
+    except Exception as exc:
+        logger.warning("Manual upload parse failed for %s: %s", original_name, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Не вдалося розібрати PDF: {exc}",
+        ) from exc
+
+    lessons = sanitize_lessons(bundle.get("lessons") or [])
+    warnings = bundle.get("warnings") or []
+    if not lessons:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="У файлі не знайдено жодної пари. Перевірте, що це розклад, а не графік навчального процесу.",
+        )
+
+    file_hash = sha256_bytes(raw)
+    try:
+        result = add_manual_file(
+            original_name=original_name,
+            file_hash=file_hash,
+            items=lessons,
+            warnings_count=len(warnings),
+            note=note,
+        )
+    except Exception as exc:
+        logger.warning("Manual upload persist failed for %s: %s", original_name, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Помилка збереження: {exc}",
+        ) from exc
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={
+            "status": "ok",
+            "manual_id": result["manual_id"],
+            "source_url": result["source_url"],
+            "lessons_added": result["lessons"],
+            "warnings_count": len(warnings),
+            "original_name": original_name,
+            "note": note,
+        },
+    )
+
+
+@app.get("/api/v1/admin/uploads")
+def list_uploads(x_sync_token: str | None = Header(default=None, alias="X-Sync-Token")):
+    """List all manually-uploaded schedule files (newest first).
+
+    Requires ``X-Sync-Token`` when ``SYNC_TOKEN`` is configured.
+    """
+    _require_sync_token(x_sync_token)
+    return {"uploads": list_manual_files()}
+
+
+@app.delete("/api/v1/admin/uploads/{manual_id}")
+def remove_upload(
+    manual_id: int,
+    x_sync_token: str | None = Header(default=None, alias="X-Sync-Token"),
+):
+    """Delete a manual upload and all its lessons.
+
+    Removing a manual file un-shadows the portal rows for the same
+    (date, group, lesson_number): the portal schedule becomes authoritative
+    again for those pairs. Requires ``X-Sync-Token`` when ``SYNC_TOKEN`` is set.
+    """
+    _require_sync_token(x_sync_token)
+    deleted = delete_manual_file(manual_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Файл із id={manual_id} не знайдено",
+        )
+    return {"status": "deleted", "manual_id": manual_id}

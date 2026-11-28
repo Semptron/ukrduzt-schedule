@@ -25,3 +25,29 @@ const Map<String, String> kHttpHeaders = {
 /// more headroom.
 const Duration kMetadataTimeout = Duration(seconds: 15);
 const Duration kScheduleTimeout = Duration(seconds: 30);
+
+/// Which schedule source the user is browsing.
+///
+/// The portal is the scraped site; `manual` is a curator-uploaded file
+/// (see /api/v1/admin/upload). `all` keeps both and lets the backend dedup
+/// manual-over-portal for the same (date, group, pair). This is the "two
+/// sections" toggle in the UI: Розділ 1 = portal, Розділ 2 = manual.
+enum ScheduleSource {
+  portal,
+  manual,
+  all,
+}
+
+/// The query-string value the backend expects for each source. `all` is sent
+/// as an explicit string (rather than omitted) so the same code path handles
+/// all three modes uniformly and the URL is self-describing in logs.
+String sourceQueryValue(ScheduleSource s) {
+  switch (s) {
+    case ScheduleSource.portal:
+      return 'portal';
+    case ScheduleSource.manual:
+      return 'manual';
+    case ScheduleSource.all:
+      return 'all';
+  }
+}

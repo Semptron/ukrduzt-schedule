@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'api_config.dart' show kApiBaseUrl;
+import 'manual_upload_screen.dart';
 import 'schedule_screen.dart';
 import 'teacher_search_screen.dart';
 
@@ -50,12 +51,16 @@ class _MainShellState extends State<_MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    // IndexedStack keeps each tab's state alive across switches, so a student
+    // picking a group on "Розклад" doesn't lose it when they peek at
+    // "Викладачі" and come back.
     final pages = [
       ScheduleScreen(apiBaseUrl: widget.apiBaseUrl),
       TeacherSearchScreen(
         apiBaseUrl: widget.apiBaseUrl,
         isActive: _index == 1,
       ),
+      ManualUploadScreen(apiBaseUrl: widget.apiBaseUrl),
     ];
 
     return Scaffold(
@@ -73,6 +78,11 @@ class _MainShellState extends State<_MainShell> {
             icon: Icon(Icons.person_search_outlined),
             selectedIcon: Icon(Icons.person_search),
             label: 'Викладачі',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.upload_file_outlined),
+            selectedIcon: Icon(Icons.upload_file),
+            label: 'Додати файл',
           ),
         ],
       ),
